@@ -21,6 +21,11 @@ T = TypeVar("T")
 
 
 class MinPLogitsProcessor(LogitsProcessor):
+    @classmethod
+    def needs_output_token_ids(cls) -> bool:
+        # Does not read output token ids at all.
+        return False
+
     def __init__(
         self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
     ):
@@ -117,6 +122,11 @@ class MinPLogitsProcessor(LogitsProcessor):
 
 
 class LogitBiasLogitsProcessor(LogitsProcessor):
+    @classmethod
+    def needs_output_token_ids(cls) -> bool:
+        # Does not read output token ids at all.
+        return False
+
     def __init__(self, _, device: torch.device, is_pin_memory: bool):
         self.device = device
         self.biases: dict[int, dict[int, float]] = {}
@@ -163,6 +173,12 @@ class LogitBiasLogitsProcessor(LogitsProcessor):
 
 
 class MinTokensLogitsProcessor(LogitsProcessor):
+    @classmethod
+    def needs_output_token_ids(cls) -> bool:
+        # Only reads the *length* of the output ids list; -1 placeholders
+        # keep the length correct under async scheduling.
+        return False
+
     def __init__(
         self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
     ):

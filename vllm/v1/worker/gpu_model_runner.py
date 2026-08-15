@@ -713,17 +713,23 @@ class GPUModelRunner(
             kernel_block_sizes=[placeholder_block_size],
             max_num_blocks_per_req=[placeholder_max_num_blocks],
             num_spec_tokens=self.num_spec_tokens,
-            logitsprocs=build_logitsprocs(
-                self.vllm_config,
-                self.device,
-                PIN_MEMORY,
-                self.is_pooling_model,
-                custom_logitsprocs,
+            logitsprocs=(
+                logitsprocs := build_logitsprocs(
+                    self.vllm_config,
+                    self.device,
+                    PIN_MEMORY,
+                    self.is_pooling_model,
+                    custom_logitsprocs,
+                )
             ),
-            # We currently don't know whether a particular custom logits processor
-            # uses output token ids so we set this conservatively. Thinking-budget
-            # tracking is requested dynamically when a budgeted request is in the batch.
-            logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
+            # Each loaded processor (builtin, entry-point plugin or CLI custom)
+            # declares whether it reads output token id values; out-of-tree
+            # processors conservatively default to True via the base class.
+            # Thinking-budget tracking is requested dynamically when a budgeted
+            # request is in the batch.
+            logitsprocs_need_output_token_ids=any(
+                type(lp).needs_output_token_ids() for lp in logitsprocs.all
+            ),
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config=self.vllm_config.reasoning_config,

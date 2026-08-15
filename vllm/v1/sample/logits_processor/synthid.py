@@ -31,15 +31,15 @@ Behavioural notes:
   requests receive no effective watermark.
 * Not validated in combination with speculative decoding.
 
-Async-scheduling incompatibility: with async scheduling enabled, the
-worker-side ``output_token_ids`` lists referenced by logits processors are
-extended with ``-1`` placeholders (real token ids stay on the GPU in
-``prev_sampled_token_ids``), so the watermark context window would hash
-garbage. The builtin vLLM processors only read the *length* of that list
-and are unaffected; this processor reads the *values*. When async
-scheduling is on, opted-in requests are therefore left unwatermarked and a
-warning is logged — start the server with ``--no-async-scheduling`` to use
-watermarking.
+Async-scheduling note: under async scheduling the worker-side
+``output_token_ids`` lists are extended with ``-1`` placeholders (real
+token ids stay on the GPU in ``prev_sampled_token_ids``). This processor
+therefore declares ``needs_output_token_ids() -> True``, which makes the
+engine repair the placeholders with the real sampled ids right before
+logits processors run (``InputBatch.update_async_output_token_ids``), so
+the watermark context window always hashes real tokens. ``apply()``
+additionally skips any step whose window still contains a placeholder
+(defense in depth for paths not covered by the repair).
 """
 
 from __future__ import annotations
@@ -115,19 +115,17 @@ class SynthIDLogitsProcessor(LogitsProcessor):
                  is_pin_memory: bool) -> None:
         self.device = device
         self.rows: dict[int, _RowState] = {}
-        sched = getattr(vllm_config, "scheduler_config", None)
-        self.async_scheduling = bool(getattr(sched, "async_scheduling", False))
-        if self.async_scheduling:
-            logger.warning(
-                "SynthID watermarking is incompatible with async scheduling "
-                "(worker-side output_token_ids hold -1 placeholders, so the "
-                "watermark context window would be wrong). Requests opting "
-                "in via synthid_wm will NOT be watermarked. Restart with "
-                "--no-async-scheduling to enable watermarking.")
 
     def is_argmax_invariant(self) -> bool:
         # The watermark reweights logits and may change argmax.
         return False
+
+    @classmethod
+    def needs_output_token_ids(cls) -> bool:
+        # The watermark context window hashes output token *values*; this
+        # declaration makes the engine repair async-scheduling -1
+        # placeholders before apply() runs.
+        return True
 
     def _new_state(self, params: "SamplingParams",
                    prompt_tok_ids: list[int] | None,
@@ -135,10 +133,6 @@ class SynthIDLogitsProcessor(LogitsProcessor):
         extra = getattr(params, "extra_args", None) or {}
         if not extra.get("synthid_wm"):
             return None  # not opted in -> no state, zero overhead
-        if self.async_scheduling:
-            # Fail safe: a wrongly-seeded watermark is worse than none
-            # (see async-scheduling note in the module docstring).
-            return None
         from transformers.generation import SynthIDTextWatermarkLogitsProcessor
 
         proc = SynthIDTextWatermarkLogitsProcessor(

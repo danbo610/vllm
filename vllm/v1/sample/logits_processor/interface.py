@@ -68,6 +68,21 @@ class LogitsProcessor(ABC):
         """
         return None
 
+    @classmethod
+    def needs_output_token_ids(cls) -> bool:
+        """Whether this processor reads the *values* of the per-request
+        ``output_tok_ids`` lists (rather than, at most, their length).
+
+        Under async scheduling, the worker-side lists referenced by logits
+        processors are extended with -1 placeholders; the engine repairs
+        them with the real sampled ids right before logits processors run,
+        but only when at least one loaded processor declares that it needs
+        them. Defaults to True (conservative) so out-of-tree processors
+        keep seeing real ids; processors that never read the values should
+        override this to False to avoid the repair-path synchronization.
+        """
+        return True
+
     @abstractmethod
     def __init__(
         self, vllm_config: "VllmConfig", device: torch.device, is_pin_memory: bool
