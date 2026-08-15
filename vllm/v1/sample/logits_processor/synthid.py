@@ -30,6 +30,16 @@ Behavioural notes:
 * Watermarking requires stochastic sampling; greedy (``temperature=0``)
   requests receive no effective watermark.
 * Not validated in combination with speculative decoding.
+
+Async-scheduling incompatibility: with async scheduling enabled, the
+worker-side ``output_token_ids`` lists referenced by logits processors are
+extended with ``-1`` placeholders (real token ids stay on the GPU in
+``prev_sampled_token_ids``), so the watermark context window would hash
+garbage. The builtin vLLM processors only read the *length* of that list
+and are unaffected; this processor reads the *values*. When async
+scheduling is on, opted-in requests are therefore left unwatermarked and a
+warning is logged — start the server with ``--no-async-scheduling`` to use
+watermarking.
 """
 
 from __future__ import annotations
@@ -105,6 +115,15 @@ class SynthIDLogitsProcessor(LogitsProcessor):
                  is_pin_memory: bool) -> None:
         self.device = device
         self.rows: dict[int, _RowState] = {}
+        sched = getattr(vllm_config, "scheduler_config", None)
+        self.async_scheduling = bool(getattr(sched, "async_scheduling", False))
+        if self.async_scheduling:
+            logger.warning(
+                "SynthID watermarking is incompatible with async scheduling "
+                "(worker-side output_token_ids hold -1 placeholders, so the "
+                "watermark context window would be wrong). Requests opting "
+                "in via synthid_wm will NOT be watermarked. Restart with "
+                "--no-async-scheduling to enable watermarking.")
 
     def is_argmax_invariant(self) -> bool:
         # The watermark reweights logits and may change argmax.
@@ -116,6 +135,10 @@ class SynthIDLogitsProcessor(LogitsProcessor):
         extra = getattr(params, "extra_args", None) or {}
         if not extra.get("synthid_wm"):
             return None  # not opted in -> no state, zero overhead
+        if self.async_scheduling:
+            # Fail safe: a wrongly-seeded watermark is worse than none
+            # (see async-scheduling note in the module docstring).
+            return None
         from transformers.generation import SynthIDTextWatermarkLogitsProcessor
 
         proc = SynthIDTextWatermarkLogitsProcessor(
@@ -140,8 +163,10 @@ class SynthIDLogitsProcessor(LogitsProcessor):
             return logits
         for idx, state in self.rows.items():
             ctx = (state.prompt_tail + state.out_ids)[-(NGRAM_LEN - 1):]
-            if len(ctx) < NGRAM_LEN - 1:
-                # Window not yet full (ultra-short prompt); skip this step.
+            if len(ctx) < NGRAM_LEN - 1 or min(ctx) < 0:
+                # Window not yet full (ultra-short prompt), or it contains
+                # placeholder ids (async/PP paths) — skip rather than hash
+                # a wrong window.
                 continue
             input_ids = torch.tensor([ctx], dtype=torch.long,
                                      device=logits.device)
