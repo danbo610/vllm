@@ -79,8 +79,62 @@ class LocalDiskBackend(StorageBackend):
             pass
 
 
+class RemoteBackend(StorageBackend):
+    """Length-prefixed TCP client to a remote SecureKV store (M4).
+
+    Wire protocol (see remote_server.py): one request per call,
+    ``<op:1B><klen:u32><key><vlen:u32><val>`` -> ``<status:1B><rlen:u32><data>``.
+    A fresh short-lived connection per op keeps the client trivially
+    thread-safe under the crypto thread pool. Only ciphertext crosses the
+    socket — the remote store never sees plaintext or keys.
+    """
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 14580,
+                 timeout: float = 10.0):
+        self.addr = (host, port)
+        self.timeout = timeout
+
+    def _rpc(self, op: bytes, key: str, val: bytes = b"") -> tuple[int, bytes]:
+        import socket
+        import struct
+        kb = key.encode()
+        req = op + struct.pack("<I", len(kb)) + kb + struct.pack("<I", len(val)) + val
+        with socket.create_connection(self.addr, self.timeout) as s:
+            s.sendall(req)
+            head = _recv_exact(s, 5)
+            status, rlen = head[0], struct.unpack("<I", head[1:5])[0]
+            return status, _recv_exact(s, rlen)
+
+    def put(self, key: str, blob: bytes) -> None:
+        self._rpc(b"P", key, blob)
+
+    def get(self, key: str) -> bytes | None:
+        status, data = self._rpc(b"G", key)
+        return data if status == 1 else None
+
+    def contains(self, key: str) -> bool:
+        status, _ = self._rpc(b"C", key)
+        return status == 1
+
+    def delete(self, key: str) -> None:
+        self._rpc(b"D", key)
+
+
+def _recv_exact(sock, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("remote SecureKV store closed early")
+        buf += chunk
+    return bytes(buf)
+
+
 def make_backend(kind: str, config: dict) -> StorageBackend:
     if kind == "local_disk":
         return LocalDiskBackend(config.get("root_dir", "/tmp/skv_cache"))
+    if kind == "remote":
+        return RemoteBackend(config.get("host", "127.0.0.1"),
+                             int(config.get("port", 14580)))
     raise ValueError(f"unknown SecureKV backend: {kind!r} "
-                     "(supported: local_disk; remote/lmcache arrive with M4)")
+                     "(supported: local_disk, remote; LMCache adapter TBD)")

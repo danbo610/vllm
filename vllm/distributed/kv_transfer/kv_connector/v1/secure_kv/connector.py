@@ -36,6 +36,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.backend import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.crypto import (
     CryptoEngine,
+    DecryptError,
     pack_tensor,
     unpack_tensor,
 )
@@ -62,6 +63,12 @@ class ReqMeta:
     slot_mapping: torch.Tensor
     is_store: bool
     mm_hashes: list[str]
+    # Tenant resolved on the scheduler side, carried to the worker so both
+    # sides derive the same key (they are different processes; §5.2 note).
+    tenant_id: str
+    # Block ids for this request, so a decrypt failure can name the exact
+    # blocks to recompute (§3 point 7 / M3 graceful degradation).
+    block_ids: list[int]
 
     @staticmethod
     def make_meta(
@@ -70,6 +77,7 @@ class ReqMeta:
         block_size: int,
         is_store: bool,
         mm_hashes: list[str],
+        tenant_id: str,
     ) -> "ReqMeta":
         valid_num_tokens = align_to_block_size(len(token_ids), block_size)
         token_ids_tensor = torch.tensor(token_ids)[:valid_num_tokens]
@@ -86,6 +94,8 @@ class ReqMeta:
             slot_mapping=slot_mapping,
             is_store=is_store,
             mm_hashes=mm_hashes,
+            tenant_id=tenant_id,
+            block_ids=list(block_ids),
         )
 
 
@@ -100,9 +110,11 @@ class SecureKVConnectorMetadata(KVConnectorMetadata):
         block_size: int,
         is_store: bool,
         mm_hashes: list[str],
+        tenant_id: str,
     ) -> None:
         self.requests.append(
-            ReqMeta.make_meta(token_ids, block_ids, block_size, is_store, mm_hashes)
+            ReqMeta.make_meta(token_ids, block_ids, block_size, is_store,
+                              mm_hashes, tenant_id)
         )
 
 
@@ -129,7 +141,11 @@ class SecureKVConnector(KVConnectorBase_V1):
         master_hex = None
         if key_source.startswith("env:"):
             master_hex = os.environ.get(key_source[4:], "")
-        self._tenant_id = extra.get("tenant_id", "default")
+        # Default tenant when a request carries no tenant (single-tenant mode).
+        self._default_tenant = extra.get("tenant_id", "default")
+        # Request extra_args key that carries the tenant (gateway injects it,
+        # same channel as SynthID watermarking; §8).
+        self._tenant_arg = extra.get("tenant_arg", "skv_tenant")
         self._km = KeyManager(master_hex)
         self._crypto = CryptoEngine(self._km,
                                     workers=int(extra.get("crypto_workers", 4)))
@@ -138,8 +154,13 @@ class SecureKVConnector(KVConnectorBase_V1):
         # Model fingerprint for AAD: cross-model blob reuse must fail auth.
         self._model_fp = hashlib.sha256(
             vllm_config.model_config.model.encode()).digest()[:8]
-        logger.info("SecureKV: backend=%s tenant=%s (payloads AES-256-GCM)",
-                    extra.get("backend", "local_disk"), self._tenant_id)
+        # Scheduler-side: request_id -> tenant_id, resolved in on_new_request.
+        self._req_tenant: dict[str, str] = {}
+        # Worker-side: block ids whose decrypt failed this pass (M3 recompute).
+        self._load_error_blocks: set[int] = set()
+        logger.info("SecureKV: backend=%s default_tenant=%s (payloads "
+                    "AES-256-GCM, per-request tenant keying)",
+                    extra.get("backend", "local_disk"), self._default_tenant)
 
     # ==============================
     # Worker side
@@ -176,34 +197,66 @@ class SecureKVConnector(KVConnectorBase_V1):
         for request in metadata.requests:
             if request.is_store:
                 continue
-            logger.info(
-                "SecureKV: decrypt-and-inject KV of %d tokens into paged memory",
-                len(request.slot_mapping),
-            )
-            index_key = self._index_key(request.token_ids, request.mm_hashes)
+            index_key = self._index_key(request.token_ids, request.mm_hashes,
+                                        request.tenant_id)
+            # Gather every attention layer's blob, then decrypt them all in
+            # parallel (M4: the per-request critical path is L sequential
+            # decrypts otherwise; L=24..64 layers). Decrypt failure on ANY
+            # layer taints the whole request — a partially-injected prefix is
+            # unusable, so recompute it all.
+            layers, blobs = [], []
+            missing = False
             for layer_name in forward_context.no_compile_layers:
                 layer = forward_context.no_compile_layers[layer_name]
                 kv_cache_layer = getattr(layer, "kv_cache", None)
                 if kv_cache_layer is None:
                     continue
-
                 blob = self._backend.get(self._layer_key(index_key, layer_name))
                 if blob is None:
-                    raise RuntimeError(
-                        f"SecureKV: blob missing for layer {layer_name} "
-                        f"(index {index_key[:12]}…) — inconsistent store")
-                plaintext = self._crypto.unseal(
-                    blob, self._tenant_id,
-                    expected_aad=self._aad(index_key, layer_name))
-                kv_cache = unpack_tensor(plaintext).to(
-                    device=kv_cache_layer.device)
+                    missing = True
+                    break
+                layers.append((layer_name, kv_cache_layer))
+                blobs.append(blob)
+
+            if missing:
+                self._load_error_blocks.update(request.block_ids)
+                continue
+
+            results = self._crypto.unseal_many([
+                (blob, request.tenant_id,
+                 self._aad(index_key, ln, request.tenant_id))
+                for (ln, _), blob in zip(layers, blobs)
+            ])
+            bad = next((r for r in results if isinstance(r, DecryptError)), None)
+            if bad is not None:
+                # Never crash the engine: mark blocks for recompute and raise a
+                # security alert (§3 point 7). Tag failure => tampering /
+                # cross-tenant / corruption.
+                logger.warning(
+                    "SecureKV SECURITY: decrypt failed (index %s…, tenant %s): "
+                    "%s — recomputing %d blocks",
+                    index_key[:12], request.tenant_id, bad,
+                    len(request.block_ids))
+                self._load_error_blocks.update(request.block_ids)
+                continue
+
+            for (layer_name, kv_cache_layer), plaintext in zip(layers, results):
+                kv_cache = unpack_tensor(plaintext).to(device=kv_cache_layer.device)
                 if isinstance(attn_metadata, dict):
                     inject_kv_into_layer(
-                        kv_cache_layer,
-                        kv_cache,
-                        request.slot_mapping,
-                        attn_metadata[layer_name],
-                    )
+                        kv_cache_layer, kv_cache, request.slot_mapping,
+                        attn_metadata[layer_name])
+            logger.info(
+                "SecureKV: decrypt-and-inject KV of %d tokens into paged "
+                "memory (tenant %s, %d layers)",
+                len(request.slot_mapping), request.tenant_id, len(layers))
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        # Reported once, then cleared: the engine recomputes these blocks
+        # (requires kv_load_failure_policy="recompute").
+        errs = self._load_error_blocks
+        self._load_error_blocks = set()
+        return errs
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return
@@ -230,12 +283,13 @@ class SecureKVConnector(KVConnectorBase_V1):
         assert isinstance(connector_metadata, SecureKVConnectorMetadata)
         for request in connector_metadata.requests:
             if request.is_store:
-                index_key = self._index_key(request.token_ids, request.mm_hashes)
+                index_key = self._index_key(request.token_ids, request.mm_hashes,
+                                            request.tenant_id)
                 kv_cache = extract_kv_from_layer(kv_layer, request.slot_mapping)
                 blob = self._crypto.seal(
                     pack_tensor(kv_cache),
-                    aad=self._aad(index_key, layer_name),
-                    tenant_id=self._tenant_id)
+                    aad=self._aad(index_key, layer_name, request.tenant_id),
+                    tenant_id=request.tenant_id)
                 self._backend.put(self._layer_key(index_key, layer_name), blob)
 
     def wait_for_save(self):
@@ -245,6 +299,20 @@ class SecureKVConnector(KVConnectorBase_V1):
     # Scheduler side
     # ==============================
 
+    def on_new_request(self, request: "Request") -> None:
+        """Resolve the request's tenant (§8): extra_args[tenant_arg] if the
+        gateway injected one, else the configured default. Cached for the
+        scheduler-side match/meta calls."""
+        tenant = self._default_tenant
+        sp = getattr(request, "sampling_params", None)
+        extra = getattr(sp, "extra_args", None) if sp else None
+        if extra and extra.get(self._tenant_arg):
+            tenant = str(extra[self._tenant_arg])
+        self._req_tenant[request.request_id] = tenant
+
+    def _tenant_of(self, request: "Request") -> str:
+        return self._req_tenant.get(request.request_id, self._default_tenant)
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -253,7 +321,8 @@ class SecureKVConnector(KVConnectorBase_V1):
         if not self._found_match_for_request(request):
             return 0, False
 
-        logger.info("SecureKV: external (encrypted) cache hit!")
+        logger.info("SecureKV: external (encrypted) cache hit! (tenant %s)",
+                    self._tenant_of(request))
         token_ids = request.prompt_token_ids or []
         num_tokens_to_check = align_to_block_size(len(token_ids) - 1, self._block_size)
         return num_tokens_to_check - num_computed_tokens, False
@@ -274,6 +343,7 @@ class SecureKVConnector(KVConnectorBase_V1):
         for new_req in scheduler_output.scheduled_new_reqs:
             token_ids = new_req.prompt_token_ids or []
             mm_hashes = [f.identifier for f in new_req.mm_features]
+            tenant = self._req_tenant.get(new_req.req_id, self._default_tenant)
             if new_req.req_id in self._requests_need_load:
                 meta.add_request(
                     token_ids=token_ids,
@@ -281,16 +351,18 @@ class SecureKVConnector(KVConnectorBase_V1):
                     block_size=self._block_size,
                     is_store=False,
                     mm_hashes=mm_hashes,
+                    tenant_id=tenant,
                 )
                 total_need_load += 1
             else:
-                if not self._found_match_for_prompt(token_ids, mm_hashes):
+                if not self._found_match_for_prompt(token_ids, mm_hashes, tenant):
                     meta.add_request(
                         token_ids=token_ids,
                         block_ids=new_req.block_ids[0],
                         block_size=self._block_size,
                         is_store=True,
                         mm_hashes=mm_hashes,
+                        tenant_id=tenant,
                     )
 
         cached_reqs = scheduler_output.scheduled_cached_reqs
@@ -316,12 +388,18 @@ class SecureKVConnector(KVConnectorBase_V1):
                 block_size=self._block_size,
                 is_store=False,
                 mm_hashes=[f.identifier for f in request.mm_features],
+                tenant_id=self._req_tenant.get(req_id, self._default_tenant),
             )
             total_need_load += 1
 
         assert total_need_load == len(self._requests_need_load)
         self._requests_need_load.clear()
         return meta
+
+    def request_finished(self, request, block_ids):
+        # Drop cached tenant mapping when the request leaves the scheduler.
+        self._req_tenant.pop(request.request_id, None)
+        return False, None
 
     def shutdown(self):
         self._km.wipe()
@@ -330,43 +408,49 @@ class SecureKVConnector(KVConnectorBase_V1):
     # Helper functions
     # ==============================
 
-    def _index_key(self, token_ids: torch.Tensor, mm_hashes: list[str]) -> str:
-        """HMAC index key over the (aligned) prompt tokens (§7.3)."""
+    def _index_key(self, token_ids: torch.Tensor, mm_hashes: list[str],
+                   tenant_id: str) -> str:
+        """HMAC index key over the (aligned) prompt tokens (§7.3). Keyed by
+        the tenant, so the same prefix maps to different keys per tenant —
+        cross-tenant sharing and prefix probing are both impossible."""
         token_bytes = token_ids.numpy().tobytes()
         if mm_hashes:
             token_bytes += "-".join(mm_hashes).encode("utf-8")
-        return self._km.index_hmac(self._tenant_id, token_bytes)
+        return self._km.index_hmac(tenant_id, token_bytes)
 
     def _layer_key(self, index_key: str, layer_name: str) -> str:
         layer_digest = hashlib.sha256(layer_name.encode()).hexdigest()[:16]
         return f"{index_key}/{layer_digest}"
 
-    def _aad(self, index_key: str, layer_name: str) -> bytes:
+    def _aad(self, index_key: str, layer_name: str, tenant_id: str) -> bytes:
         """Blob identity bound into GCM authentication (§7.2)."""
         return b"|".join([
             b"skv1",
             index_key.encode(),
             layer_name.encode(),
             self._model_fp,
-            self._km.tenant_tag(self._tenant_id),
+            self._km.tenant_tag(tenant_id),
         ])
 
     def _found_match_for_request(self, request: "Request") -> bool:
         return self._found_match_for_prompt(
             list(request.prompt_token_ids or []),
             [f.identifier for f in request.mm_features],
+            self._tenant_of(request),
         )
 
     def _found_match_for_prompt(
         self,
         prompt_token_ids: list[int],
         mm_hashes: list[str],
+        tenant_id: str,
     ) -> bool:
         num_tokens_to_check = align_to_block_size(
             len(prompt_token_ids) - 1, self._block_size
         )
         index_key = self._index_key(
-            torch.tensor(prompt_token_ids)[:num_tokens_to_check], mm_hashes)
+            torch.tensor(prompt_token_ids)[:num_tokens_to_check], mm_hashes,
+            tenant_id)
         return self._backend.contains(index_key)
 
 
