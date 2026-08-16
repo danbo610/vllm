@@ -314,6 +314,10 @@ def test_factory_configures_encrypted_fs_capacity_and_metrics(tmp_path, monkeypa
             "max_bytes": max_bytes,
             "min_free_bytes": 0,
             "eviction_low_watermark": 0.8,
+            "crypto_workers": 2,
+            "read_io_workers": 3,
+            "write_io_workers": 1,
+            "max_inflight_blocks": 4,
             "n_read_threads": 1,
             "n_write_threads": 1,
         },
@@ -329,6 +333,10 @@ def test_factory_configures_encrypted_fs_capacity_and_metrics(tmp_path, monkeypa
         assert set(definitions) == set(EncryptedFsMetrics.definitions())
         assert definitions[EncryptedFsMetrics.QUEUE_DEPTH].labelnames == ("operation",)
         assert definitions[EncryptedFsMetrics.JOB_TOTAL_SECONDS].labelnames == (
+            "operation",
+        )
+        assert definitions[EncryptedFsMetrics.CONCURRENCY_WAIT_SECONDS].labelnames == (
+            "resource",
             "operation",
         )
 
@@ -350,8 +358,122 @@ def test_factory_configures_encrypted_fs_capacity_and_metrics(tmp_path, monkeypa
         assert reduced[f"{EncryptedFsMetrics.QUEUE_DEPTH}:('store',)"] == 0
         assert reduced[f"{EncryptedFsMetrics.INFLIGHT_JOBS}:('load',)"] == 0
         assert reduced[f"{EncryptedFsMetrics.INFLIGHT_JOBS}:('store',)"] == 0
+        assert reduced[f"{EncryptedFsMetrics.CONCURRENCY_LIMIT}:('pipeline',)"] == 4
+        assert reduced[f"{EncryptedFsMetrics.CONCURRENCY_LIMIT}:('crypto',)"] == 2
+        assert reduced[f"{EncryptedFsMetrics.CONCURRENCY_LIMIT}:('read_io',)"] == 3
+        assert reduced[f"{EncryptedFsMetrics.CONCURRENCY_LIMIT}:('write_io',)"] == 1
+        for resource in ("pipeline", "crypto", "read_io", "write_io"):
+            for operation in ("load", "store"):
+                assert (
+                    reduced[
+                        f"{EncryptedFsMetrics.ACTIVE_SLOTS}:"
+                        f"('{resource}', '{operation}')"
+                    ]
+                    == 0
+                )
     finally:
         tier.shutdown()
+
+
+def test_encrypted_fs_limits_crypto_and_write_concurrency(tmp_path, monkeypatch):
+    monkeypatch.setenv("SKV_MASTER_KEY", "00" * 16)
+    tensor = _page_aligned_rand_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    tier = SecondaryTierFactory.create_secondary_tier(
+        {
+            "type": "encrypted_fs",
+            "root_dir": str(tmp_path),
+            "max_bytes": 64 * 1024 * 1024,
+            "min_free_bytes": 0,
+            "crypto_workers": 2,
+            "read_io_workers": 2,
+            "write_io_workers": 1,
+            "max_inflight_blocks": 3,
+            "n_read_threads": 4,
+            "n_write_threads": 4,
+        },
+        memoryview(tensor.numpy()),
+        _MOCK_OFFLOADING_SPEC,
+    )
+    lock = threading.Lock()
+    active = {"crypto": 0, "write_io": 0}
+    peak = {"crypto": 0, "write_io": 0}
+
+    def track_stage(stage, task, *args, **kwargs):
+        with lock:
+            active[stage] += 1
+            peak[stage] = max(peak[stage], active[stage])
+        try:
+            time.sleep(0.03)
+            return task(*args, **kwargs)
+        finally:
+            with lock:
+                active[stage] -= 1
+
+    original_seal = tier._crypto.seal_parts
+    original_store = tier._capacity.store_blob_parts
+    monkeypatch.setattr(
+        tier._crypto,
+        "seal_parts",
+        lambda *args, **kwargs: track_stage("crypto", original_seal, *args, **kwargs),
+    )
+    monkeypatch.setattr(
+        tier._capacity,
+        "store_blob_parts",
+        lambda *args, **kwargs: track_stage(
+            "write_io", original_store, *args, **kwargs
+        ),
+    )
+
+    try:
+        for job_id in range(6):
+            tier.submit_store(make_job(job_id, [key(job_id)], [job_id]))
+        results = drain(tier)
+
+        assert len(results) == 6
+        assert all(result.success for result in results)
+        assert peak == {"crypto": 2, "write_io": 1}
+
+        stats = tier.get_stats()
+        assert stats is not None
+        values = stats.data["data"]
+        wait_metric = values[EncryptedFsMetrics.CONCURRENCY_WAIT_SECONDS]
+        assert len(wait_metric[("pipeline", "store")]) == 6
+        assert len(wait_metric[("crypto", "store")]) == 6
+        assert len(wait_metric[("write_io", "store")]) == 6
+        for resource in ("pipeline", "crypto", "read_io", "write_io"):
+            for operation in ("load", "store"):
+                assert (
+                    values[EncryptedFsMetrics.ACTIVE_SLOTS][(resource, operation)] == 0
+                )
+    finally:
+        tier.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("crypto_workers", 0),
+        ("read_io_workers", False),
+        ("write_io_workers", -1),
+        ("max_inflight_blocks", 0),
+        ("n_read_threads", 0),
+        ("n_write_threads", False),
+    ],
+)
+def test_encrypted_fs_rejects_invalid_concurrency(tmp_path, monkeypatch, option, value):
+    monkeypatch.setenv("SKV_MASTER_KEY", "00" * 16)
+    tensor = _page_aligned_zero_tensor(1, _BLOCK_ELEMENTS)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        SecondaryTierFactory.create_secondary_tier(
+            {
+                "type": "encrypted_fs",
+                "root_dir": str(tmp_path),
+                option: value,
+            },
+            memoryview(tensor.numpy()),
+            _MOCK_OFFLOADING_SPEC,
+        )
 
 
 def test_encrypted_fs_failed_decrypt_removes_blob_and_invalidates_hit(

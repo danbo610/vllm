@@ -65,7 +65,13 @@ cross-tenant sharing and prefix probing are both impossible by construction.
         "root_dir": "/data/kv_cache",
         "max_bytes": 274877906944,
         "min_free_bytes": 137438953472,
-        "eviction_low_watermark": 0.9
+        "eviction_low_watermark": 0.9,
+        "crypto_workers": 2,
+        "read_io_workers": 2,
+        "write_io_workers": 2,
+        "max_inflight_blocks": 4,
+        "n_read_threads": 4,
+        "n_write_threads": 4
       }
     ]
   }
@@ -79,6 +85,22 @@ Capacity fields:
 | `max_bytes` | Hard limit for encrypted `.bin` files; omit to disable this limit | unset |
 | `min_free_bytes` | Filesystem space that must remain free after a write | `0` |
 | `eviction_low_watermark` | Target fraction after max-capacity eviction | `0.9` |
+
+Concurrency fields:
+
+| Field | Meaning | Default |
+|---|---|---|
+| `crypto_workers` | Maximum concurrent AES seal/unseal operations | `2` |
+| `read_io_workers` | Maximum concurrent ciphertext reads | `2` |
+| `write_io_workers` | Maximum concurrent writes and invalidations | `2` |
+| `max_inflight_blocks` | Maximum blocks in the encrypted FS pipeline | `4` |
+| `n_read_threads` | Read-priority FS scheduling threads | `4` |
+| `n_write_threads` | Write-priority FS scheduling threads | `4` |
+
+The scheduling threads may drain either queue, while the stage limits are
+global to the tier. This keeps enough threads available for load priority
+without allowing large blocks to multiply AES buffers or buffered I/O without
+bound.
 
 Existing encrypted blocks are scanned when the tier starts. Before admitting a
 new block, the manager evicts the oldest files by `mtime` until both limits can
@@ -124,6 +146,9 @@ vllm:kv_offload_encrypted_fs_read_bytes
 vllm:kv_offload_encrypted_fs_written_bytes
 vllm:kv_offload_encrypted_fs_queue_depth{operation="load|store"}
 vllm:kv_offload_encrypted_fs_inflight_jobs{operation="load|store"}
+vllm:kv_offload_encrypted_fs_concurrency_wait_seconds{resource,operation}
+vllm:kv_offload_encrypted_fs_active_slots{resource,operation}
+vllm:kv_offload_encrypted_fs_concurrency_limit{resource}
 vllm:kv_offload_encrypted_fs_decrypt_failures
 vllm:kv_offload_encrypted_fs_load_failures
 vllm:kv_offload_encrypted_fs_store_failures

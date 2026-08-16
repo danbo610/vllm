@@ -30,7 +30,7 @@ import os
 import struct
 import threading
 import time
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from typing import Any
 
 from typing_extensions import override
@@ -45,6 +45,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.crypto import (
 from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.fs_capacity import (
     EncryptedFsCapacityManager,
     writev_all,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.fs_concurrency import (
+    EncryptedFsConcurrency,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.fs_metrics import (
     EncryptedFsMetrics,
@@ -84,13 +87,21 @@ def _tmp_suffix() -> str:
     return f".tmp{os.getpid()}_{threading.get_ident()}"
 
 
-def _remove_failed_blob(path: str, capacity: EncryptedFsCapacityManager | None) -> bool:
+def _remove_failed_blob(
+    path: str,
+    capacity: EncryptedFsCapacityManager | None,
+    concurrency: EncryptedFsConcurrency | None = None,
+) -> bool:
+    io_slot = (
+        concurrency.write_slot("load") if concurrency is not None else nullcontext()
+    )
     try:
-        if capacity is None:
-            os.remove(path)
-            removed = True
-        else:
-            removed = capacity.remove_blob(path)
+        with io_slot:
+            if capacity is None:
+                os.remove(path)
+                removed = True
+            else:
+                removed = capacity.remove_blob(path)
     except FileNotFoundError:
         return False
     except Exception:
@@ -110,64 +121,83 @@ def _encrypt_store(
     block_size: int,
     capacity: EncryptedFsCapacityManager | None = None,
     telemetry: EncryptedFsTelemetry | None = None,
+    concurrency: EncryptedFsConcurrency | None = None,
 ) -> None:
     """Seal each block and write it atomically. Raises on first error
     (the thread pool converts that into job failure)."""
     flat = view.cast("B")
     for path, key, off in zip(paths, keys, offsets):
-        if capacity is None and os.path.exists(path):
-            continue
+        block_slot = (
+            concurrency.block_slot("store")
+            if concurrency is not None
+            else nullcontext()
+        )
+        with block_slot:
+            if capacity is None and os.path.exists(path):
+                continue
 
-        plaintext = flat[off : off + block_size]
+            plaintext = flat[off : off + block_size]
 
-        started_at = time.monotonic()
-        try:
-            blob_parts = crypto.seal_parts(plaintext, _aad(key), _TIER_KEY_NS)
-        finally:
+            crypto_slot = (
+                concurrency.crypto_slot("store")
+                if concurrency is not None
+                else nullcontext()
+            )
+            with crypto_slot:
+                started_at = time.monotonic()
+                try:
+                    blob_parts = crypto.seal_parts(plaintext, _aad(key), _TIER_KEY_NS)
+                finally:
+                    if telemetry is not None:
+                        telemetry.observe(
+                            EncryptedFsMetrics.ENCRYPT_SECONDS,
+                            time.monotonic() - started_at,
+                        )
             if telemetry is not None:
-                telemetry.observe(
-                    EncryptedFsMetrics.ENCRYPT_SECONDS,
-                    time.monotonic() - started_at,
-                )
-        if telemetry is not None:
-            telemetry.increase(EncryptedFsMetrics.ENCRYPTED_BYTES, len(plaintext))
-        blob_size = sum(len(part) for part in blob_parts)
+                telemetry.increase(EncryptedFsMetrics.ENCRYPTED_BYTES, len(plaintext))
+            blob_size = sum(len(part) for part in blob_parts)
 
-        started_at = time.monotonic()
-        if capacity is not None:
-            try:
-                stored = capacity.store_blob_parts(path, blob_parts)
-            finally:
-                if telemetry is not None:
-                    telemetry.observe(
-                        EncryptedFsMetrics.FS_WRITE_SECONDS,
-                        time.monotonic() - started_at,
-                    )
-            if telemetry is not None and stored:
+            write_slot = (
+                concurrency.write_slot("store")
+                if concurrency is not None
+                else nullcontext()
+            )
+            with write_slot:
+                started_at = time.monotonic()
+                if capacity is not None:
+                    try:
+                        stored = capacity.store_blob_parts(path, blob_parts)
+                    finally:
+                        if telemetry is not None:
+                            telemetry.observe(
+                                EncryptedFsMetrics.FS_WRITE_SECONDS,
+                                time.monotonic() - started_at,
+                            )
+                    if telemetry is not None and stored:
+                        telemetry.increase(EncryptedFsMetrics.FS_WRITE_BYTES, blob_size)
+                    continue
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                tmp = path + _tmp_suffix()
+                try:
+                    with open(tmp, "xb", buffering=0) as f:
+                        written = writev_all(f.fileno(), blob_parts)
+                        if written != blob_size:
+                            raise OSError(
+                                f"short encrypted block write: {written} != {blob_size}"
+                            )
+                    os.replace(tmp, path)
+                except Exception:
+                    with suppress(OSError):
+                        os.remove(tmp)
+                    raise
+                finally:
+                    if telemetry is not None:
+                        telemetry.observe(
+                            EncryptedFsMetrics.FS_WRITE_SECONDS,
+                            time.monotonic() - started_at,
+                        )
+            if telemetry is not None:
                 telemetry.increase(EncryptedFsMetrics.FS_WRITE_BYTES, blob_size)
-            continue
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + _tmp_suffix()
-        try:
-            with open(tmp, "xb", buffering=0) as f:
-                written = writev_all(f.fileno(), blob_parts)
-                if written != blob_size:
-                    raise OSError(
-                        f"short encrypted block write: {written} != {blob_size}"
-                    )
-            os.replace(tmp, path)
-        except Exception:
-            with suppress(OSError):
-                os.remove(tmp)
-            raise
-        finally:
-            if telemetry is not None:
-                telemetry.observe(
-                    EncryptedFsMetrics.FS_WRITE_SECONDS,
-                    time.monotonic() - started_at,
-                )
-        if telemetry is not None:
-            telemetry.increase(EncryptedFsMetrics.FS_WRITE_BYTES, blob_size)
 
 
 def _decrypt_load(
@@ -179,67 +209,86 @@ def _decrypt_load(
     block_size: int,
     capacity: EncryptedFsCapacityManager | None = None,
     telemetry: EncryptedFsTelemetry | None = None,
+    concurrency: EncryptedFsConcurrency | None = None,
 ) -> None:
     """Read, tag-verify and unseal each block into the shared CPU buffer.
     A failed tag raises DecryptError -> job failure -> the engine treats the
     load as failed (never injects garbage KV)."""
     flat = view.cast("B")
     for path, key, off in zip(paths, keys, offsets):
-        try:
-            started_at = time.monotonic()
+        block_slot = (
+            concurrency.block_slot("load") if concurrency is not None else nullcontext()
+        )
+        with block_slot:
             try:
-                if capacity is None:
-                    with open(path, "rb") as f:
-                        blob = f.read()
-                else:
-                    blob = capacity.load_blob(path)
-            finally:
+                read_slot = (
+                    concurrency.read_slot("load")
+                    if concurrency is not None
+                    else nullcontext()
+                )
+                with read_slot:
+                    started_at = time.monotonic()
+                    try:
+                        if capacity is None:
+                            with open(path, "rb") as f:
+                                blob = f.read()
+                        else:
+                            blob = capacity.load_blob(path)
+                    finally:
+                        if telemetry is not None:
+                            telemetry.observe(
+                                EncryptedFsMetrics.FS_READ_SECONDS,
+                                time.monotonic() - started_at,
+                            )
                 if telemetry is not None:
-                    telemetry.observe(
-                        EncryptedFsMetrics.FS_READ_SECONDS,
-                        time.monotonic() - started_at,
-                    )
-            if telemetry is not None:
-                telemetry.increase(EncryptedFsMetrics.FS_READ_BYTES, len(blob))
+                    telemetry.increase(EncryptedFsMetrics.FS_READ_BYTES, len(blob))
 
-            started_at = time.monotonic()
-            try:
-                plaintext = crypto.unseal(blob, _TIER_KEY_NS, expected_aad=_aad(key))
-            except DecryptError:
-                if telemetry is not None:
-                    telemetry.increase(EncryptedFsMetrics.DECRYPT_FAILURES)
+                crypto_slot = (
+                    concurrency.crypto_slot("load")
+                    if concurrency is not None
+                    else nullcontext()
+                )
+                with crypto_slot:
+                    started_at = time.monotonic()
+                    try:
+                        plaintext = crypto.unseal(
+                            blob, _TIER_KEY_NS, expected_aad=_aad(key)
+                        )
+                    except DecryptError:
+                        if telemetry is not None:
+                            telemetry.increase(EncryptedFsMetrics.DECRYPT_FAILURES)
+                        raise
+                    finally:
+                        if telemetry is not None:
+                            telemetry.observe(
+                                EncryptedFsMetrics.DECRYPT_SECONDS,
+                                time.monotonic() - started_at,
+                            )
+                if len(plaintext) != block_size:
+                    raise ValueError(
+                        f"sealed block {os.path.basename(path)} decrypted to "
+                        f"{len(plaintext)} bytes, expected {block_size}"
+                    )
+            except Exception:
+                removed = _remove_failed_blob(path, capacity, concurrency)
+                if removed and telemetry is not None:
+                    telemetry.increase(EncryptedFsMetrics.INVALIDATED_BLOCKS)
                 raise
+
+            started_at = time.monotonic()
+            try:
+                flat[off : off + block_size] = plaintext
             finally:
                 if telemetry is not None:
                     telemetry.observe(
-                        EncryptedFsMetrics.DECRYPT_SECONDS,
+                        EncryptedFsMetrics.COPY_SECONDS,
                         time.monotonic() - started_at,
+                        ("load",),
                     )
-            if len(plaintext) != block_size:
-                raise ValueError(
-                    f"sealed block {os.path.basename(path)} decrypted to "
-                    f"{len(plaintext)} bytes, expected {block_size}"
-                )
-        except Exception:
-            removed = _remove_failed_blob(path, capacity)
-            if removed and telemetry is not None:
-                telemetry.increase(EncryptedFsMetrics.INVALIDATED_BLOCKS)
-            raise
-
-        started_at = time.monotonic()
-        try:
-            flat[off : off + block_size] = plaintext
-        finally:
             if telemetry is not None:
-                telemetry.observe(
-                    EncryptedFsMetrics.COPY_SECONDS,
-                    time.monotonic() - started_at,
-                    ("load",),
-                )
-        if telemetry is not None:
-            telemetry.increase(EncryptedFsMetrics.DECRYPTED_BYTES, len(plaintext))
-        if capacity is not None:
-            capacity.touch(path)
+                telemetry.increase(EncryptedFsMetrics.DECRYPTED_BYTES, len(plaintext))
+            if capacity is not None:
+                capacity.touch(path)
 
 
 class EncryptedFileSystemTierManager(FileSystemTierManager):
@@ -251,6 +300,11 @@ class EncryptedFileSystemTierManager(FileSystemTierManager):
         *args,
         key_source: str = "env:SKV_MASTER_KEY",
         crypto_workers: int = 2,
+        read_io_workers: int = 2,
+        write_io_workers: int = 2,
+        max_inflight_blocks: int = 4,
+        n_read_threads: int = 4,
+        n_write_threads: int = 4,
         max_bytes: int | None = None,
         min_free_bytes: int = 0,
         eviction_low_watermark: float = 0.9,
@@ -259,14 +313,32 @@ class EncryptedFileSystemTierManager(FileSystemTierManager):
         root_dir = kwargs.get("root_dir")
         if not isinstance(root_dir, str):
             raise ValueError("encrypted_fs requires a string root_dir")
-        super().__init__(*args, **kwargs)
+        for name, value in (
+            ("n_read_threads", n_read_threads),
+            ("n_write_threads", n_write_threads),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        self._telemetry = EncryptedFsTelemetry()
+        self._concurrency = EncryptedFsConcurrency(
+            self._telemetry,
+            crypto_workers=crypto_workers,
+            read_io_workers=read_io_workers,
+            write_io_workers=write_io_workers,
+            max_inflight_blocks=max_inflight_blocks,
+        )
+        super().__init__(
+            *args,
+            n_read_threads=n_read_threads,
+            n_write_threads=n_write_threads,
+            **kwargs,
+        )
         # Ciphertext length is header+payload+tag: not O_DIRECT-alignable.
         self._use_o_direct = False
         master_hex = None
         if key_source.startswith("env:"):
             master_hex = os.environ.get(key_source[4:], "")
         self._crypto = CryptoEngine(KeyManager(master_hex), workers=crypto_workers)
-        self._telemetry = EncryptedFsTelemetry()
         self._load_job_keys = {}
         self._capacity = (
             EncryptedFsCapacityManager(
@@ -281,12 +353,19 @@ class EncryptedFileSystemTierManager(FileSystemTierManager):
         logger.info(
             "EncryptedFileSystemTier '%s': AES-256-GCM at rest under %s "
             "(global tier key; per-tenant isolation via cache_salt; "
-            "max_bytes=%s; min_free_bytes=%d; low_watermark=%.3f)",
+            "max_bytes=%s; min_free_bytes=%d; low_watermark=%.3f; "
+            "threads=%d+%d; pipeline=%d; crypto=%d; read_io=%d; write_io=%d)",
             self.tier_type,
             self.file_mapper.get_config_file_path(),
             str(max_bytes),
             min_free_bytes,
             eviction_low_watermark,
+            n_read_threads,
+            n_write_threads,
+            max_inflight_blocks,
+            crypto_workers,
+            read_io_workers,
+            write_io_workers,
         )
 
     @classmethod
@@ -310,6 +389,7 @@ class EncryptedFileSystemTierManager(FileSystemTierManager):
             self._block_size,
             self._capacity,
             self._telemetry,
+            self._concurrency,
         )
         enqueued_at = self._telemetry.job_enqueued("store")
         timed_task = functools.partial(
@@ -334,6 +414,7 @@ class EncryptedFileSystemTierManager(FileSystemTierManager):
             self._block_size,
             self._capacity,
             self._telemetry,
+            self._concurrency,
         )
         enqueued_at = self._telemetry.job_enqueued("load")
         timed_task = functools.partial(

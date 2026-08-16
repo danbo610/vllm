@@ -20,6 +20,7 @@ from vllm.v1.kv_offload.base import (
 )
 
 Operation = Literal["load", "store"]
+ConcurrencyResource = Literal["pipeline", "crypto", "read_io", "write_io"]
 
 _STAGE_TIME_BUCKETS = (
     0.001,
@@ -56,6 +57,7 @@ class EncryptedFsMetrics:
     COPY_SECONDS = "vllm:kv_offload_encrypted_fs_plaintext_copy_seconds"
     JOB_QUEUE_SECONDS = "vllm:kv_offload_encrypted_fs_job_queue_seconds"
     JOB_TOTAL_SECONDS = "vllm:kv_offload_encrypted_fs_job_total_seconds"
+    CONCURRENCY_WAIT_SECONDS = "vllm:kv_offload_encrypted_fs_concurrency_wait_seconds"
 
     ENCRYPTED_BYTES = "vllm:kv_offload_encrypted_fs_encrypted_bytes"
     DECRYPTED_BYTES = "vllm:kv_offload_encrypted_fs_decrypted_bytes"
@@ -67,6 +69,8 @@ class EncryptedFsMetrics:
     DECRYPT_FAILURES = "vllm:kv_offload_encrypted_fs_decrypt_failures"
     QUEUE_DEPTH = "vllm:kv_offload_encrypted_fs_queue_depth"
     INFLIGHT_JOBS = "vllm:kv_offload_encrypted_fs_inflight_jobs"
+    ACTIVE_SLOTS = "vllm:kv_offload_encrypted_fs_active_slots"
+    CONCURRENCY_LIMIT = "vllm:kv_offload_encrypted_fs_concurrency_limit"
 
     @classmethod
     def definitions(cls) -> dict[str, OffloadingMetricMetadata]:
@@ -127,6 +131,11 @@ class EncryptedFsMetrics:
                 labelnames=operation_label,
                 buckets=_STAGE_TIME_BUCKETS,
             ),
+            cls.CONCURRENCY_WAIT_SECONDS: OffloadingHistogramMetadata(
+                documentation="Time waiting for an encrypted FS concurrency slot.",
+                labelnames=("resource", "operation"),
+                buckets=_STAGE_TIME_BUCKETS,
+            ),
             cls.ENCRYPTED_BYTES: OffloadingCounterMetadata(
                 documentation="Plaintext KV bytes successfully encrypted."
             ),
@@ -159,6 +168,14 @@ class EncryptedFsMetrics:
                 documentation="Encrypted filesystem jobs queued or executing.",
                 labelnames=operation_label,
             ),
+            cls.ACTIVE_SLOTS: OffloadingGaugeMetadata(
+                documentation="Encrypted FS concurrency slots currently occupied.",
+                labelnames=("resource", "operation"),
+            ),
+            cls.CONCURRENCY_LIMIT: OffloadingGaugeMetadata(
+                documentation="Configured encrypted FS concurrency limit.",
+                labelnames=("resource",),
+            ),
         }
 
 
@@ -170,6 +187,39 @@ class EncryptedFsTelemetry:
         self._stats = OffloadingConnectorStats()
         self._queue_depth: dict[Operation, int] = {"load": 0, "store": 0}
         self._inflight_jobs: dict[Operation, int] = {"load": 0, "store": 0}
+        self._concurrency_limits: dict[ConcurrencyResource, int] = {}
+        self._active_slots: dict[tuple[ConcurrencyResource, Operation], int] = {}
+
+    def set_concurrency_limits(self, limits: dict[ConcurrencyResource, int]) -> None:
+        with self._lock:
+            self._concurrency_limits = dict(limits)
+            self._active_slots = {
+                (resource, operation): 0
+                for resource in limits
+                for operation in ("load", "store")
+            }
+
+    def slot_acquired(
+        self,
+        resource: ConcurrencyResource,
+        operation: Operation,
+        wait_seconds: float,
+    ) -> None:
+        with self._lock:
+            key = (resource, operation)
+            self._active_slots[key] += 1
+            self._stats.observe_histogram(
+                EncryptedFsMetrics.CONCURRENCY_WAIT_SECONDS,
+                wait_seconds,
+                key,
+            )
+
+    def slot_released(
+        self, resource: ConcurrencyResource, operation: Operation
+    ) -> None:
+        with self._lock:
+            key = (resource, operation)
+            self._active_slots[key] -= 1
 
     def job_enqueued(self, operation: Operation) -> float:
         enqueued_at = time.monotonic()
@@ -239,6 +289,19 @@ class EncryptedFsTelemetry:
                     self._inflight_jobs[operation],
                     labelvalues,
                 )
+            for resource, limit in self._concurrency_limits.items():
+                stats.set_gauge(
+                    EncryptedFsMetrics.CONCURRENCY_LIMIT,
+                    limit,
+                    (resource,),
+                )
+                for operation in ("load", "store"):
+                    labelvalues = (resource, operation)
+                    stats.set_gauge(
+                        EncryptedFsMetrics.ACTIVE_SLOTS,
+                        self._active_slots[labelvalues],
+                        labelvalues,
+                    )
             for metric in (
                 EncryptedFsMetrics.ENCRYPTED_BYTES,
                 EncryptedFsMetrics.DECRYPTED_BYTES,
