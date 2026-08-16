@@ -8,6 +8,7 @@ The tier manager writes KV cache blocks to disk and reads them back, verifying
 data integrity throughout the process.
 """
 
+import errno
 import mmap
 import os
 import threading
@@ -18,6 +19,9 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.fs_capacity import (
+    EncryptedFsCapacityManager,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.fs_metrics import (
     EncryptedFsMetrics,
 )
@@ -447,6 +451,67 @@ def test_encrypted_fs_limits_crypto_and_write_concurrency(tmp_path, monkeypatch)
                 )
     finally:
         tier.shutdown()
+
+
+def test_encrypted_fs_buffered_io_advises_and_drops_cache(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        os,
+        "posix_fallocate",
+        lambda fd, offset, length: calls.append(("fallocate", offset, length)),
+    )
+    monkeypatch.setattr(
+        os,
+        "posix_fadvise",
+        lambda fd, offset, length, advice: calls.append(("fadvise", advice)),
+    )
+    monkeypatch.setattr(os, "fdatasync", lambda fd: calls.append(("fdatasync",)))
+    capacity = EncryptedFsCapacityManager(
+        str(tmp_path), max_bytes=1024 * 1024, min_free_bytes=0
+    )
+    path = str(tmp_path / "block.bin")
+    blob = b"header" + b"ciphertext" * 1024
+
+    assert capacity.store_blob_parts(path, (blob[:6], blob[6:]))
+    assert capacity.load_blob(path) == blob
+    assert ("fallocate", 0, len(blob)) in calls
+    assert calls.count(("fdatasync",)) == 1
+    assert calls.count(("fadvise", os.POSIX_FADV_SEQUENTIAL)) == 2
+    assert calls.count(("fadvise", os.POSIX_FADV_DONTNEED)) == 2
+
+
+def test_encrypted_fs_unsupported_preallocation_falls_back(tmp_path, monkeypatch):
+    def unsupported(fd, offset, length):
+        raise OSError(errno.EOPNOTSUPP, "not supported")
+
+    monkeypatch.setattr(os, "posix_fallocate", unsupported)
+    capacity = EncryptedFsCapacityManager(
+        str(tmp_path), max_bytes=1024 * 1024, min_free_bytes=0
+    )
+    path = str(tmp_path / "block.bin")
+
+    assert capacity.store_blob(path, b"ciphertext")
+    assert capacity.load_blob(path) == b"ciphertext"
+
+
+def test_encrypted_fs_sync_failure_rolls_back_admission(tmp_path, monkeypatch):
+    def fail_sync(fd):
+        raise OSError(errno.EIO, "sync failed")
+
+    monkeypatch.setattr(os, "fdatasync", fail_sync)
+    capacity = EncryptedFsCapacityManager(
+        str(tmp_path), max_bytes=1024 * 1024, min_free_bytes=0
+    )
+    path = str(tmp_path / "block.bin")
+
+    with pytest.raises(OSError, match="sync failed"):
+        capacity.store_blob(path, b"ciphertext")
+
+    snapshot = capacity.snapshot(reset_counters=False)
+    assert not os.path.exists(path)
+    assert not list(tmp_path.glob("*.tmp*"))
+    assert snapshot.current_bytes == 0
+    assert snapshot.current_files == 0
 
 
 @pytest.mark.parametrize(

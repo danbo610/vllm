@@ -169,6 +169,16 @@ read from disk, so `AESGCM.decrypt` does not require a second
 ciphertext-sized slice. The AES output and final plaintext copy into the CPU
 pool remain necessary.
 
+Encrypted records remain buffered because their header and authentication tag
+make the length unsuitable for the official tier's aligned `O_DIRECT` path.
+The buffered path uses `POSIX_FADV_SEQUENTIAL`, best-effort file preallocation,
+segmented `writev`, and exactly sized `readv`. Store calls `fdatasync` before
+the atomic rename and then issues `POSIX_FADV_DONTNEED`; load drops the file
+pages after they have been copied into the ciphertext buffer. This prevents the
+filesystem page cache from becoming an unbounded duplicate KV tier. Unsupported
+preallocation or advice falls back transparently, while allocation and sync
+failures still fail the job and roll back capacity accounting.
+
 ## Security properties (tested)
 
 - Sealed payloads only: on-disk/remote bytes are `SKV1` blobs; ciphertext is

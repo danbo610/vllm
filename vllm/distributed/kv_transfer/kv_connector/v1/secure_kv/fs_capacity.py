@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -37,6 +38,55 @@ def writev_all(fd: int, parts: Sequence[Buffer]) -> int:
         if written:
             views[0] = views[0][written:]
     return total
+
+
+def _advise_file(fd: int, advice: int | None) -> None:
+    posix_fadvise = getattr(os, "posix_fadvise", None)
+    if posix_fadvise is None or advice is None:
+        return
+    with suppress(OSError):
+        posix_fadvise(fd, 0, 0, advice)
+
+
+def _preallocate(fd: int, size: int) -> None:
+    posix_fallocate = getattr(os, "posix_fallocate", None)
+    if posix_fallocate is None:
+        return
+    try:
+        posix_fallocate(fd, 0, size)
+    except OSError as exc:
+        if exc.errno not in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
+            raise
+
+
+def write_blob_parts(fd: int, parts: Sequence[Buffer]) -> int:
+    """Persist segmented ciphertext and release its buffered pages."""
+    size = sum(memoryview(part).nbytes for part in parts)
+    _advise_file(fd, getattr(os, "POSIX_FADV_SEQUENTIAL", None))
+    _preallocate(fd, size)
+    written = writev_all(fd, parts)
+    if written != size:
+        raise OSError(f"short encrypted block write: {written} != {size}")
+    fdatasync = getattr(os, "fdatasync", os.fsync)
+    fdatasync(fd)
+    _advise_file(fd, getattr(os, "POSIX_FADV_DONTNEED", None))
+    return written
+
+
+def read_blob(fd: int) -> bytearray:
+    """Read a complete ciphertext file into one exactly sized buffer."""
+    size = os.fstat(fd).st_size
+    blob = bytearray(size)
+    view = memoryview(blob)
+    offset = 0
+    _advise_file(fd, getattr(os, "POSIX_FADV_SEQUENTIAL", None))
+    while offset < size:
+        bytes_read = os.readv(fd, [view[offset:]])
+        if bytes_read <= 0:
+            raise OSError(f"short encrypted block read: {offset} != {size}")
+        offset += bytes_read
+    _advise_file(fd, getattr(os, "POSIX_FADV_DONTNEED", None))
+    return blob
 
 
 class CacheCapacityError(RuntimeError):
@@ -371,11 +421,7 @@ class EncryptedFsCapacityManager:
             temp_path = f"{path}.tmp{os.getpid()}_{threading.get_ident()}"
             try:
                 with open(temp_path, "xb", buffering=0) as cache_file:
-                    written = writev_all(cache_file.fileno(), parts)
-                    if written != blob_size:
-                        raise OSError(
-                            f"short encrypted block write: {written} != {blob_size}"
-                        )
+                    write_blob_parts(cache_file.fileno(), parts)
                 os.replace(temp_path, path)
             except Exception:
                 self._write_state_locked(state)
@@ -386,13 +432,14 @@ class EncryptedFsCapacityManager:
             self._set_current(admitted_state)
             return True
 
-    def load_blob(self, path: str) -> bytes:
+    def load_blob(self, path: str) -> bytearray:
         """Read one block while preventing concurrent eviction."""
-        with (
-            self._directory_lock(exclusive=False),
-            open(path, "rb") as cache_file,
-        ):
-            return cache_file.read()
+        with self._directory_lock(exclusive=False):
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                return read_blob(fd)
+            finally:
+                os.close(fd)
 
     def remove_blob(self, path: str) -> bool:
         """Remove one invalid block and update shared capacity state."""

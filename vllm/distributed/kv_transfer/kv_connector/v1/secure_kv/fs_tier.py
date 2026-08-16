@@ -44,7 +44,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.crypto import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.fs_capacity import (
     EncryptedFsCapacityManager,
-    writev_all,
+    read_blob,
+    write_blob_parts,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.fs_concurrency import (
     EncryptedFsConcurrency,
@@ -180,11 +181,7 @@ def _encrypt_store(
                 tmp = path + _tmp_suffix()
                 try:
                     with open(tmp, "xb", buffering=0) as f:
-                        written = writev_all(f.fileno(), blob_parts)
-                        if written != blob_size:
-                            raise OSError(
-                                f"short encrypted block write: {written} != {blob_size}"
-                            )
+                        write_blob_parts(f.fileno(), blob_parts)
                     os.replace(tmp, path)
                 except Exception:
                     with suppress(OSError):
@@ -230,8 +227,11 @@ def _decrypt_load(
                     started_at = time.monotonic()
                     try:
                         if capacity is None:
-                            with open(path, "rb") as f:
-                                blob = f.read()
+                            fd = os.open(path, os.O_RDONLY)
+                            try:
+                                blob = read_blob(fd)
+                            finally:
+                                os.close(fd)
                         else:
                             blob = capacity.load_blob(path)
                     finally:
