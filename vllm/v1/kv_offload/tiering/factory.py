@@ -77,3 +77,9 @@ SecondaryTierFactory.register_tier(
     "vllm.v1.kv_offload.tiering.obj.manager",
     "ObjectStoreSecondaryTierManager",
 )
+
+SecondaryTierFactory.register_tier(
+    "encrypted_fs",
+    "vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.fs_tier",
+    "EncryptedFileSystemTierManager",
+)
