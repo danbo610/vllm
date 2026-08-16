@@ -29,6 +29,7 @@ import functools
 import os
 import struct
 import threading
+import time
 from contextlib import suppress
 from typing import Any
 
@@ -39,17 +40,21 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.crypto import (
     CryptoEngine,
+    DecryptError,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.fs_capacity import (
     EncryptedFsCapacityManager,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.fs_metrics import (
+    EncryptedFsMetrics,
+    EncryptedFsTelemetry,
+    run_timed_job,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.keys import (
     KeyManager,
 )
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
-    OffloadingCounterMetadata,
-    OffloadingGaugeMetadata,
     OffloadingMetricMetadata,
     get_offload_block_hash,
     get_offload_group_idx,
@@ -61,17 +66,6 @@ logger = init_logger(__name__)
 # Global-key namespace for the tier (no request context at this layer;
 # isolation is cache_salt's job at the hit layer).
 _TIER_KEY_NS = "fs-tier"
-
-
-class EncryptedFsMetrics:
-    CACHE_BYTES = "vllm:kv_offload_encrypted_fs_cache_bytes"
-    CACHE_FILES = "vllm:kv_offload_encrypted_fs_cache_files"
-    CACHE_USAGE_PERC = "vllm:kv_offload_encrypted_fs_cache_usage_perc"
-    DISK_FREE_BYTES = "vllm:kv_offload_encrypted_fs_disk_free_bytes"
-    EVICTED_BYTES = "vllm:kv_offload_encrypted_fs_evicted_bytes"
-    EVICTED_FILES = "vllm:kv_offload_encrypted_fs_evicted_files"
-    ADMISSION_REJECTIONS = "vllm:kv_offload_encrypted_fs_admission_rejections"
-    STALE_TEMP_FILES_REMOVED = "vllm:kv_offload_encrypted_fs_stale_temp_files_removed"
 
 
 def _aad(key) -> bytes:
@@ -89,7 +83,7 @@ def _tmp_suffix() -> str:
     return f".tmp{os.getpid()}_{threading.get_ident()}"
 
 
-def _remove_failed_blob(path: str, capacity: EncryptedFsCapacityManager | None) -> None:
+def _remove_failed_blob(path: str, capacity: EncryptedFsCapacityManager | None) -> bool:
     try:
         if capacity is None:
             os.remove(path)
@@ -97,12 +91,13 @@ def _remove_failed_blob(path: str, capacity: EncryptedFsCapacityManager | None) 
         else:
             removed = capacity.remove_blob(path)
     except FileNotFoundError:
-        return
+        return False
     except Exception:
         logger.exception("Failed to remove unreadable encrypted KV block %s", path)
-        return
+        return False
     if removed:
         logger.warning("Removed unreadable encrypted KV block %s", path)
+    return removed
 
 
 def _encrypt_store(
@@ -113,6 +108,7 @@ def _encrypt_store(
     offsets,
     block_size: int,
     capacity: EncryptedFsCapacityManager | None = None,
+    telemetry: EncryptedFsTelemetry | None = None,
 ) -> None:
     """Seal each block and write it atomically. Raises on first error
     (the thread pool converts that into job failure)."""
@@ -120,9 +116,42 @@ def _encrypt_store(
     for path, key, off in zip(paths, keys, offsets):
         if capacity is None and os.path.exists(path):
             continue
-        blob = crypto.seal(bytes(flat[off : off + block_size]), _aad(key), _TIER_KEY_NS)
+
+        started_at = time.monotonic()
+        try:
+            plaintext = bytes(flat[off : off + block_size])
+        finally:
+            if telemetry is not None:
+                telemetry.observe(
+                    EncryptedFsMetrics.COPY_SECONDS,
+                    time.monotonic() - started_at,
+                    ("store",),
+                )
+
+        started_at = time.monotonic()
+        try:
+            blob = crypto.seal(plaintext, _aad(key), _TIER_KEY_NS)
+        finally:
+            if telemetry is not None:
+                telemetry.observe(
+                    EncryptedFsMetrics.ENCRYPT_SECONDS,
+                    time.monotonic() - started_at,
+                )
+        if telemetry is not None:
+            telemetry.increase(EncryptedFsMetrics.ENCRYPTED_BYTES, len(plaintext))
+
+        started_at = time.monotonic()
         if capacity is not None:
-            capacity.store_blob(path, blob)
+            try:
+                stored = capacity.store_blob(path, blob)
+            finally:
+                if telemetry is not None:
+                    telemetry.observe(
+                        EncryptedFsMetrics.FS_WRITE_SECONDS,
+                        time.monotonic() - started_at,
+                    )
+            if telemetry is not None and stored:
+                telemetry.increase(EncryptedFsMetrics.FS_WRITE_BYTES, len(blob))
             continue
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + _tmp_suffix()
@@ -134,6 +163,14 @@ def _encrypt_store(
             with suppress(OSError):
                 os.remove(tmp)
             raise
+        finally:
+            if telemetry is not None:
+                telemetry.observe(
+                    EncryptedFsMetrics.FS_WRITE_SECONDS,
+                    time.monotonic() - started_at,
+                )
+        if telemetry is not None:
+            telemetry.increase(EncryptedFsMetrics.FS_WRITE_BYTES, len(blob))
 
 
 def _decrypt_load(
@@ -144,6 +181,7 @@ def _decrypt_load(
     offsets,
     block_size: int,
     capacity: EncryptedFsCapacityManager | None = None,
+    telemetry: EncryptedFsTelemetry | None = None,
 ) -> None:
     """Read, tag-verify and unseal each block into the shared CPU buffer.
     A failed tag raises DecryptError -> job failure -> the engine treats the
@@ -151,21 +189,58 @@ def _decrypt_load(
     flat = view.cast("B")
     for path, key, off in zip(paths, keys, offsets):
         try:
-            if capacity is None:
-                with open(path, "rb") as f:
-                    blob = f.read()
-            else:
-                blob = capacity.load_blob(path)
-            plaintext = crypto.unseal(blob, _TIER_KEY_NS, expected_aad=_aad(key))
+            started_at = time.monotonic()
+            try:
+                if capacity is None:
+                    with open(path, "rb") as f:
+                        blob = f.read()
+                else:
+                    blob = capacity.load_blob(path)
+            finally:
+                if telemetry is not None:
+                    telemetry.observe(
+                        EncryptedFsMetrics.FS_READ_SECONDS,
+                        time.monotonic() - started_at,
+                    )
+            if telemetry is not None:
+                telemetry.increase(EncryptedFsMetrics.FS_READ_BYTES, len(blob))
+
+            started_at = time.monotonic()
+            try:
+                plaintext = crypto.unseal(blob, _TIER_KEY_NS, expected_aad=_aad(key))
+            except DecryptError:
+                if telemetry is not None:
+                    telemetry.increase(EncryptedFsMetrics.DECRYPT_FAILURES)
+                raise
+            finally:
+                if telemetry is not None:
+                    telemetry.observe(
+                        EncryptedFsMetrics.DECRYPT_SECONDS,
+                        time.monotonic() - started_at,
+                    )
             if len(plaintext) != block_size:
                 raise ValueError(
                     f"sealed block {os.path.basename(path)} decrypted to "
                     f"{len(plaintext)} bytes, expected {block_size}"
                 )
         except Exception:
-            _remove_failed_blob(path, capacity)
+            removed = _remove_failed_blob(path, capacity)
+            if removed and telemetry is not None:
+                telemetry.increase(EncryptedFsMetrics.INVALIDATED_BLOCKS)
             raise
-        flat[off : off + block_size] = plaintext
+
+        started_at = time.monotonic()
+        try:
+            flat[off : off + block_size] = plaintext
+        finally:
+            if telemetry is not None:
+                telemetry.observe(
+                    EncryptedFsMetrics.COPY_SECONDS,
+                    time.monotonic() - started_at,
+                    ("load",),
+                )
+        if telemetry is not None:
+            telemetry.increase(EncryptedFsMetrics.DECRYPTED_BYTES, len(plaintext))
         if capacity is not None:
             capacity.touch(path)
 
@@ -194,6 +269,7 @@ class EncryptedFileSystemTierManager(FileSystemTierManager):
         if key_source.startswith("env:"):
             master_hex = os.environ.get(key_source[4:], "")
         self._crypto = CryptoEngine(KeyManager(master_hex), workers=crypto_workers)
+        self._telemetry = EncryptedFsTelemetry()
         self._load_job_keys = {}
         self._capacity = (
             EncryptedFsCapacityManager(
@@ -221,32 +297,7 @@ class EncryptedFileSystemTierManager(FileSystemTierManager):
     def build_metric_definitions(
         cls, extra_config: dict[str, Any]
     ) -> dict[str, OffloadingMetricMetadata]:
-        return {
-            EncryptedFsMetrics.CACHE_BYTES: OffloadingGaugeMetadata(
-                documentation="Encrypted filesystem cache size in bytes."
-            ),
-            EncryptedFsMetrics.CACHE_FILES: OffloadingGaugeMetadata(
-                documentation="Number of encrypted filesystem cache blocks."
-            ),
-            EncryptedFsMetrics.CACHE_USAGE_PERC: OffloadingGaugeMetadata(
-                documentation="Encrypted filesystem max capacity usage."
-            ),
-            EncryptedFsMetrics.DISK_FREE_BYTES: OffloadingGaugeMetadata(
-                documentation="Free bytes on the encrypted cache filesystem."
-            ),
-            EncryptedFsMetrics.EVICTED_BYTES: OffloadingCounterMetadata(
-                documentation="Bytes evicted from the encrypted filesystem cache."
-            ),
-            EncryptedFsMetrics.EVICTED_FILES: OffloadingCounterMetadata(
-                documentation="Blocks evicted from the encrypted filesystem cache."
-            ),
-            EncryptedFsMetrics.ADMISSION_REJECTIONS: OffloadingCounterMetadata(
-                documentation="Encrypted blocks rejected by capacity limits."
-            ),
-            EncryptedFsMetrics.STALE_TEMP_FILES_REMOVED: OffloadingCounterMetadata(
-                documentation="Stale encrypted cache temp files removed."
-            ),
-        }
+        return EncryptedFsMetrics.definitions()
 
     @override
     def submit_store(self, job_metadata) -> None:
@@ -261,8 +312,17 @@ class EncryptedFileSystemTierManager(FileSystemTierManager):
             [int(bid) * self._block_size for bid in job_metadata.block_ids],
             self._block_size,
             self._capacity,
+            self._telemetry,
         )
-        self._pool.enqueue_store(job_metadata.job_id, 1, [task])
+        enqueued_at = self._telemetry.job_enqueued("store")
+        timed_task = functools.partial(
+            run_timed_job,
+            self._telemetry,
+            "store",
+            enqueued_at,
+            task,
+        )
+        self._pool.enqueue_store(job_metadata.job_id, 1, [timed_task])
 
     @override
     def submit_load(self, job_metadata) -> None:
@@ -276,8 +336,17 @@ class EncryptedFileSystemTierManager(FileSystemTierManager):
             [int(bid) * self._block_size for bid in job_metadata.block_ids],
             self._block_size,
             self._capacity,
+            self._telemetry,
         )
-        self._pool.enqueue_load(job_metadata.job_id, 1, [task])
+        enqueued_at = self._telemetry.job_enqueued("load")
+        timed_task = functools.partial(
+            run_timed_job,
+            self._telemetry,
+            "load",
+            enqueued_at,
+            task,
+        )
+        self._pool.enqueue_load(job_metadata.job_id, 1, [timed_task])
 
     @override
     def get_finished_jobs(self):
@@ -290,10 +359,10 @@ class EncryptedFileSystemTierManager(FileSystemTierManager):
 
     @override
     def get_stats(self) -> OffloadingConnectorStats | None:
+        stats = self._telemetry.take_stats()
         if self._capacity is None:
-            return None
+            return stats
         snapshot = self._capacity.snapshot()
-        stats = OffloadingConnectorStats()
         stats.set_gauge(EncryptedFsMetrics.CACHE_BYTES, snapshot.current_bytes)
         stats.set_gauge(EncryptedFsMetrics.CACHE_FILES, snapshot.current_files)
         usage = (

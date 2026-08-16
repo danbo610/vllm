@@ -111,7 +111,30 @@ vllm:kv_offload_encrypted_fs_evicted_bytes
 vllm:kv_offload_encrypted_fs_evicted_files
 vllm:kv_offload_encrypted_fs_admission_rejections
 vllm:kv_offload_encrypted_fs_stale_temp_files_removed
+vllm:kv_offload_encrypted_fs_encrypt_seconds
+vllm:kv_offload_encrypted_fs_decrypt_seconds
+vllm:kv_offload_encrypted_fs_read_seconds
+vllm:kv_offload_encrypted_fs_write_seconds
+vllm:kv_offload_encrypted_fs_plaintext_copy_seconds{operation="load|store"}
+vllm:kv_offload_encrypted_fs_job_queue_seconds{operation="load|store"}
+vllm:kv_offload_encrypted_fs_job_total_seconds{operation="load|store"}
+vllm:kv_offload_encrypted_fs_encrypted_bytes
+vllm:kv_offload_encrypted_fs_decrypted_bytes
+vllm:kv_offload_encrypted_fs_read_bytes
+vllm:kv_offload_encrypted_fs_written_bytes
+vllm:kv_offload_encrypted_fs_queue_depth{operation="load|store"}
+vllm:kv_offload_encrypted_fs_inflight_jobs{operation="load|store"}
+vllm:kv_offload_encrypted_fs_decrypt_failures
+vllm:kv_offload_encrypted_fs_load_failures
+vllm:kv_offload_encrypted_fs_store_failures
+vllm:kv_offload_encrypted_fs_invalidated_blocks
 ```
+
+Stage histograms are observed once per block. Queue and total histograms are
+observed once per submitted secondary-tier job, which may contain multiple
+blocks. `job_total_seconds` starts at enqueue and ends when the encrypted FS
+task finishes; GPU-to-CPU and CPU-to-GPU transfer time remains in vLLM's
+standard `kv_offload_{store,load}_time` metrics.
 
 ## Security properties (tested)
 

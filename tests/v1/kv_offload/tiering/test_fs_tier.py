@@ -18,6 +18,9 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.fs_metrics import (
+    EncryptedFsMetrics,
+)
 from vllm.v1.kv_offload.base import (
     Locality,
     LookupResult,
@@ -323,16 +326,11 @@ def test_factory_configures_encrypted_fs_capacity_and_metrics(tmp_path, monkeypa
         assert tier._capacity.low_watermark == 0.8
 
         definitions = tier.build_metric_definitions({})
-        assert set(definitions) == {
-            "vllm:kv_offload_encrypted_fs_cache_bytes",
-            "vllm:kv_offload_encrypted_fs_cache_files",
-            "vllm:kv_offload_encrypted_fs_cache_usage_perc",
-            "vllm:kv_offload_encrypted_fs_disk_free_bytes",
-            "vllm:kv_offload_encrypted_fs_evicted_bytes",
-            "vllm:kv_offload_encrypted_fs_evicted_files",
-            "vllm:kv_offload_encrypted_fs_admission_rejections",
-            "vllm:kv_offload_encrypted_fs_stale_temp_files_removed",
-        }
+        assert set(definitions) == set(EncryptedFsMetrics.definitions())
+        assert definitions[EncryptedFsMetrics.QUEUE_DEPTH].labelnames == ("operation",)
+        assert definitions[EncryptedFsMetrics.JOB_TOTAL_SECONDS].labelnames == (
+            "operation",
+        )
 
         stats = tier.get_stats()
         assert stats is not None
@@ -345,6 +343,13 @@ def test_factory_configures_encrypted_fs_capacity_and_metrics(tmp_path, monkeypa
         assert reduced["vllm:kv_offload_encrypted_fs_evicted_files"] == 0
         assert reduced["vllm:kv_offload_encrypted_fs_admission_rejections"] == 0
         assert reduced["vllm:kv_offload_encrypted_fs_stale_temp_files_removed"] == 0
+        assert reduced[EncryptedFsMetrics.STORE_FAILURES] == 0
+        assert reduced[EncryptedFsMetrics.LOAD_FAILURES] == 0
+        assert reduced[EncryptedFsMetrics.DECRYPT_FAILURES] == 0
+        assert reduced[f"{EncryptedFsMetrics.QUEUE_DEPTH}:('load',)"] == 0
+        assert reduced[f"{EncryptedFsMetrics.QUEUE_DEPTH}:('store',)"] == 0
+        assert reduced[f"{EncryptedFsMetrics.INFLIGHT_JOBS}:('load',)"] == 0
+        assert reduced[f"{EncryptedFsMetrics.INFLIGHT_JOBS}:('store',)"] == 0
     finally:
         tier.shutdown()
 
@@ -386,6 +391,26 @@ def test_encrypted_fs_failed_decrypt_removes_blob_and_invalidates_hit(
         assert tier.lookup(block_key, _CTX) is LookupResult.MISS
         assert tier._capacity.snapshot().current_files == 0
         assert tier._capacity.snapshot().current_bytes == 0
+
+        stats = tier.get_stats()
+        assert stats is not None
+        values = stats.data["data"]
+        assert values[EncryptedFsMetrics.ENCRYPTED_BYTES][()] == tier._block_size
+        assert values[EncryptedFsMetrics.FS_WRITE_BYTES][()] > tier._block_size
+        assert values[EncryptedFsMetrics.DECRYPT_FAILURES][()] == 1
+        assert values[EncryptedFsMetrics.LOAD_FAILURES][()] == 1
+        assert values[EncryptedFsMetrics.STORE_FAILURES][()] == 0
+        assert values[EncryptedFsMetrics.INVALIDATED_BLOCKS][()] == 1
+        assert len(values[EncryptedFsMetrics.JOB_QUEUE_SECONDS][("store",)]) == 1
+        assert len(values[EncryptedFsMetrics.JOB_QUEUE_SECONDS][("load",)]) == 1
+        assert len(values[EncryptedFsMetrics.JOB_TOTAL_SECONDS][("store",)]) == 1
+        assert len(values[EncryptedFsMetrics.JOB_TOTAL_SECONDS][("load",)]) == 1
+        assert len(values[EncryptedFsMetrics.ENCRYPT_SECONDS][()]) == 1
+        assert len(values[EncryptedFsMetrics.DECRYPT_SECONDS][()]) == 1
+        assert len(values[EncryptedFsMetrics.FS_WRITE_SECONDS][()]) == 1
+        assert len(values[EncryptedFsMetrics.FS_READ_SECONDS][()]) == 1
+        assert len(values[EncryptedFsMetrics.COPY_SECONDS][("store",)]) == 1
+        assert ("load",) not in values[EncryptedFsMetrics.COPY_SECONDS]
     finally:
         tier.shutdown()
 
