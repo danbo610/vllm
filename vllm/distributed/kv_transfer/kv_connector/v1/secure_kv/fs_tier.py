@@ -44,6 +44,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.crypto import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.fs_capacity import (
     EncryptedFsCapacityManager,
+    writev_all,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.secure_kv.fs_metrics import (
     EncryptedFsMetrics,
@@ -117,20 +118,11 @@ def _encrypt_store(
         if capacity is None and os.path.exists(path):
             continue
 
-        started_at = time.monotonic()
-        try:
-            plaintext = bytes(flat[off : off + block_size])
-        finally:
-            if telemetry is not None:
-                telemetry.observe(
-                    EncryptedFsMetrics.COPY_SECONDS,
-                    time.monotonic() - started_at,
-                    ("store",),
-                )
+        plaintext = flat[off : off + block_size]
 
         started_at = time.monotonic()
         try:
-            blob = crypto.seal(plaintext, _aad(key), _TIER_KEY_NS)
+            blob_parts = crypto.seal_parts(plaintext, _aad(key), _TIER_KEY_NS)
         finally:
             if telemetry is not None:
                 telemetry.observe(
@@ -139,11 +131,12 @@ def _encrypt_store(
                 )
         if telemetry is not None:
             telemetry.increase(EncryptedFsMetrics.ENCRYPTED_BYTES, len(plaintext))
+        blob_size = sum(len(part) for part in blob_parts)
 
         started_at = time.monotonic()
         if capacity is not None:
             try:
-                stored = capacity.store_blob(path, blob)
+                stored = capacity.store_blob_parts(path, blob_parts)
             finally:
                 if telemetry is not None:
                     telemetry.observe(
@@ -151,13 +144,17 @@ def _encrypt_store(
                         time.monotonic() - started_at,
                     )
             if telemetry is not None and stored:
-                telemetry.increase(EncryptedFsMetrics.FS_WRITE_BYTES, len(blob))
+                telemetry.increase(EncryptedFsMetrics.FS_WRITE_BYTES, blob_size)
             continue
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + _tmp_suffix()
         try:
-            with open(tmp, "wb") as f:
-                f.write(blob)
+            with open(tmp, "xb", buffering=0) as f:
+                written = writev_all(f.fileno(), blob_parts)
+                if written != blob_size:
+                    raise OSError(
+                        f"short encrypted block write: {written} != {blob_size}"
+                    )
             os.replace(tmp, path)
         except Exception:
             with suppress(OSError):
@@ -170,7 +167,7 @@ def _encrypt_store(
                     time.monotonic() - started_at,
                 )
         if telemetry is not None:
-            telemetry.increase(EncryptedFsMetrics.FS_WRITE_BYTES, len(blob))
+            telemetry.increase(EncryptedFsMetrics.FS_WRITE_BYTES, blob_size)
 
 
 def _decrypt_load(

@@ -409,8 +409,7 @@ def test_encrypted_fs_failed_decrypt_removes_blob_and_invalidates_hit(
         assert len(values[EncryptedFsMetrics.DECRYPT_SECONDS][()]) == 1
         assert len(values[EncryptedFsMetrics.FS_WRITE_SECONDS][()]) == 1
         assert len(values[EncryptedFsMetrics.FS_READ_SECONDS][()]) == 1
-        assert len(values[EncryptedFsMetrics.COPY_SECONDS][("store",)]) == 1
-        assert ("load",) not in values[EncryptedFsMetrics.COPY_SECONDS]
+        assert EncryptedFsMetrics.COPY_SECONDS not in values
     finally:
         tier.shutdown()
 

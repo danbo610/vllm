@@ -10,7 +10,7 @@ import os
 import shutil
 import stat
 import threading
-from collections.abc import Iterator
+from collections.abc import Buffer, Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import BinaryIO
@@ -21,6 +21,22 @@ logger = init_logger(__name__)
 
 _LOCK_FILE = ".encrypted_fs_capacity.lock"
 _STATE_FILE = ".encrypted_fs_capacity.state"
+
+
+def writev_all(fd: int, parts: Sequence[Buffer]) -> int:
+    """Write all buffer parts without joining them into one bytes object."""
+    views = [memoryview(part).cast("B") for part in parts if memoryview(part).nbytes]
+    total = sum(view.nbytes for view in views)
+    while views:
+        written = os.writev(fd, views)
+        if written <= 0:
+            raise OSError("writev made no progress")
+        while views and written >= views[0].nbytes:
+            written -= views[0].nbytes
+            views.pop(0)
+        if written:
+            views[0] = views[0][written:]
+    return total
 
 
 class CacheCapacityError(RuntimeError):
@@ -320,12 +336,15 @@ class EncryptedFsCapacityManager:
             self._current_bytes = state.total_bytes
             self._current_files = state.total_files
 
-    def store_blob(self, path: str, blob: bytes) -> bool:
-        """Atomically admit and store one encrypted block.
+    def store_blob(self, path: str, blob: Buffer) -> bool:
+        return self.store_blob_parts(path, (blob,))
+
+    def store_blob_parts(self, path: str, parts: Sequence[Buffer]) -> bool:
+        """Atomically admit and store one segmented encrypted block.
 
         Returns ``False`` when another writer has already stored the path.
         """
-        blob_size = len(blob)
+        blob_size = sum(memoryview(part).nbytes for part in parts)
         if self.max_bytes is not None and blob_size > self.max_bytes:
             with self._stats_lock:
                 self._admission_rejections += 1
@@ -351,8 +370,12 @@ class EncryptedFsCapacityManager:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             temp_path = f"{path}.tmp{os.getpid()}_{threading.get_ident()}"
             try:
-                with open(temp_path, "xb") as cache_file:
-                    cache_file.write(blob)
+                with open(temp_path, "xb", buffering=0) as cache_file:
+                    written = writev_all(cache_file.fileno(), parts)
+                    if written != blob_size:
+                        raise OSError(
+                            f"short encrypted block write: {written} != {blob_size}"
+                        )
                 os.replace(temp_path, path)
             except Exception:
                 self._write_state_locked(state)

@@ -136,6 +136,14 @@ blocks. `job_total_seconds` starts at enqueue and ends when the encrypted FS
 task finishes; GPU-to-CPU and CPU-to-GPU transfer time remains in vLLM's
 standard `kv_offload_{store,load}_time` metrics.
 
+The filesystem path avoids ciphertext-sized Python intermediates. Store passes
+a slice of the primary-tier `memoryview` directly to `AESGCM.encrypt`, keeps
+the sealed record as `(header, AAD, ciphertext)` parts, and writes them with
+`os.writev`. Load parses header, AAD, and ciphertext as views over the bytes
+read from disk, so `AESGCM.decrypt` does not require a second
+ciphertext-sized slice. The AES output and final plaintext copy into the CPU
+pool remain necessary.
+
 ## Security properties (tested)
 
 - Sealed payloads only: on-disk/remote bytes are `SKV1` blobs; ciphertext is

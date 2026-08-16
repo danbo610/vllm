@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import struct
+from collections.abc import Buffer
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -26,6 +27,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 MAGIC = b"SKV1"
 FLAG_COMPRESSED = 0x1
 _HEADER = struct.Struct("<4sHH8s12sII")
+SealedBlobParts = tuple[bytes, bytes, bytes]
 
 
 class DecryptError(Exception):
@@ -58,30 +60,49 @@ class CryptoEngine:
 
     def __init__(self, key_manager, workers: int = 4):
         self.km = key_manager
-        self.pool = ThreadPoolExecutor(max_workers=workers,
-                                       thread_name_prefix="skv-crypto")
+        self.pool = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="skv-crypto"
+        )
 
-    def seal(self, plaintext: bytes, aad: bytes, tenant_id: str) -> bytes:
+    def seal_parts(
+        self, plaintext: Buffer, aad: bytes, tenant_id: str
+    ) -> SealedBlobParts:
+        """Seal a buffer without joining record metadata and ciphertext."""
         key, key_version = self.km.tenant_key(tenant_id)
         tenant_tag = self.km.tenant_tag(tenant_id)
         nonce = self.km.next_nonce(tenant_id)
         ct = AESGCM(key).encrypt(nonce, plaintext, aad)  # ciphertext||tag
-        header = _HEADER.pack(MAGIC, 0, key_version, tenant_tag, nonce,
-                              len(aad), len(ct))
-        return header + aad + ct
+        header = _HEADER.pack(
+            MAGIC, 0, key_version, tenant_tag, nonce, len(aad), len(ct)
+        )
+        return header, aad, ct
 
-    def unseal(self, blob: bytes, tenant_id: str,
-               expected_aad: bytes | None = None) -> bytes:
+    def seal(self, plaintext: Buffer, aad: bytes, tenant_id: str) -> bytes:
+        return b"".join(self.seal_parts(plaintext, aad, tenant_id))
+
+    def unseal(
+        self,
+        blob: Buffer,
+        tenant_id: str,
+        expected_aad: bytes | None = None,
+    ) -> bytes:
+        blob_view = memoryview(blob).cast("B")
         try:
             magic, flags, key_version, tenant_tag, nonce, aad_len, ct_len = (
-                _HEADER.unpack_from(blob, 0))
+                _HEADER.unpack_from(blob_view, 0)
+            )
         except struct.error as e:
             raise DecryptError(f"malformed header: {e}") from e
         if magic != MAGIC:
             raise DecryptError("bad magic")
         off = _HEADER.size
-        aad = blob[off : off + aad_len]
-        ct = blob[off + aad_len : off + aad_len + ct_len]
+        record_len = off + aad_len + ct_len
+        if record_len != len(blob_view):
+            raise DecryptError(
+                f"malformed lengths: record={len(blob_view)}, expected={record_len}"
+            )
+        aad = blob_view[off : off + aad_len]
+        ct = blob_view[off + aad_len : record_len]
         if expected_aad is not None and aad != expected_aad:
             raise DecryptError("AAD mismatch (relocated/replayed blob)")
         if tenant_tag != self.km.tenant_tag(tenant_id):
@@ -100,9 +121,11 @@ class CryptoEngine:
     def unseal_many(self, items):
         """items: list of (blob, tenant_id, expected_aad)
         -> list[bytes | DecryptError] (positional, never raises)."""
+
         def one(x):
             try:
                 return self.unseal(*x)
             except DecryptError as e:
                 return e
+
         return list(self.pool.map(one, items))
