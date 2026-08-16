@@ -300,6 +300,55 @@ def test_factory_forwards_locality_to_fs_tier(tmp_path):
         tier.shutdown()
 
 
+def test_factory_configures_encrypted_fs_capacity_and_metrics(tmp_path, monkeypatch):
+    monkeypatch.setenv("SKV_MASTER_KEY", "00" * 16)
+    tensor = _page_aligned_zero_tensor(4, _BLOCK_ELEMENTS)
+    max_bytes = 64 * 1024 * 1024
+    tier = SecondaryTierFactory.create_secondary_tier(
+        {
+            "type": "encrypted_fs",
+            "root_dir": str(tmp_path),
+            "max_bytes": max_bytes,
+            "min_free_bytes": 0,
+            "eviction_low_watermark": 0.8,
+            "n_read_threads": 1,
+            "n_write_threads": 1,
+        },
+        memoryview(tensor.numpy()),
+        _MOCK_OFFLOADING_SPEC,
+    )
+    try:
+        assert tier._capacity is not None
+        assert tier._capacity.max_bytes == max_bytes
+        assert tier._capacity.low_watermark == 0.8
+
+        definitions = tier.build_metric_definitions({})
+        assert set(definitions) == {
+            "vllm:kv_offload_encrypted_fs_cache_bytes",
+            "vllm:kv_offload_encrypted_fs_cache_files",
+            "vllm:kv_offload_encrypted_fs_cache_usage_perc",
+            "vllm:kv_offload_encrypted_fs_disk_free_bytes",
+            "vllm:kv_offload_encrypted_fs_evicted_bytes",
+            "vllm:kv_offload_encrypted_fs_evicted_files",
+            "vllm:kv_offload_encrypted_fs_admission_rejections",
+            "vllm:kv_offload_encrypted_fs_stale_temp_files_removed",
+        }
+
+        stats = tier.get_stats()
+        assert stats is not None
+        reduced = stats.reduce()
+        assert reduced["vllm:kv_offload_encrypted_fs_cache_bytes"] == 0
+        assert reduced["vllm:kv_offload_encrypted_fs_cache_files"] == 0
+        assert reduced["vllm:kv_offload_encrypted_fs_cache_usage_perc"] == 0
+        assert reduced["vllm:kv_offload_encrypted_fs_disk_free_bytes"] > 0
+        assert reduced["vllm:kv_offload_encrypted_fs_evicted_bytes"] == 0
+        assert reduced["vllm:kv_offload_encrypted_fs_evicted_files"] == 0
+        assert reduced["vllm:kv_offload_encrypted_fs_admission_rejections"] == 0
+        assert reduced["vllm:kv_offload_encrypted_fs_stale_temp_files_removed"] == 0
+    finally:
+        tier.shutdown()
+
+
 def test_failed_load_missing_file(fs_tier):
     """Test that loading a block whose file does not exist results in a failed job."""
     tier, _ = fs_tier

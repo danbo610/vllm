@@ -15,6 +15,8 @@ per-tenant keys. Backends therefore do not need to be trusted.
 | `keys.py` | Key hierarchy (master → tenant, HKDF-SHA256), nonce discipline, HMAC index keys |
 | `backend.py` | `StorageBackend` ABC + `LocalDiskBackend` + `RemoteBackend` (TCP) |
 | `remote_server.py` | Minimal remote ciphertext store for `RemoteBackend` |
+| `fs_tier.py` | Encrypted secondary tier for `TieringOffloadingSpec` |
+| `fs_capacity.py` | Cross-process disk capacity accounting and LRU eviction |
 | `selftest.py` | M1 unit suite (crypto/keys/backend; no GPU) |
 | `m3m5_test.py` | Tenant isolation, degrade, throughput, remote, attack-neutralization units |
 | `e2e_test.py`, `e2e_m3m4.py` | End-to-end phases against a real engine (see below) |
@@ -43,6 +45,66 @@ Per-request tenants: a gateway injects `"vllm_xargs": {"skv_tenant": "acme"}`;
 the connector keys every blob and index entry with that tenant's derived key.
 The same prefix under two tenants maps to different HMAC index keys, so
 cross-tenant sharing and prefix probing are both impossible by construction.
+
+## Bounded encrypted filesystem tier
+
+`encrypted_fs` can also be used as a secondary tier in the official
+`OffloadingConnector + TieringOffloadingSpec` stack:
+
+```json
+{
+  "kv_connector": "OffloadingConnector",
+  "kv_role": "kv_both",
+  "kv_load_failure_policy": "recompute",
+  "kv_connector_extra_config": {
+    "spec_name": "TieringOffloadingSpec",
+    "cpu_bytes_to_use": 8589934592,
+    "secondary_tiers": [
+      {
+        "type": "encrypted_fs",
+        "root_dir": "/data/kv_cache",
+        "max_bytes": 274877906944,
+        "min_free_bytes": 137438953472,
+        "eviction_low_watermark": 0.9
+      }
+    ]
+  }
+}
+```
+
+Capacity fields:
+
+| Field | Meaning | Default |
+|---|---|---|
+| `max_bytes` | Hard limit for encrypted `.bin` files; omit to disable this limit | unset |
+| `min_free_bytes` | Filesystem space that must remain free after a write | `0` |
+| `eviction_low_watermark` | Target fraction after max-capacity eviction | `0.9` |
+
+Existing encrypted blocks are scanned when the tier starts. Before admitting a
+new block, the manager evicts the oldest files by `mtime` until both limits can
+be met. A successful decrypt updates `mtime`, making the policy an access-based
+LRU approximation. Admission and eviction use `fcntl.flock`, so multiple vLLM
+processes sharing one root cannot independently exceed the hard limit. Reads
+hold a shared lock while copying ciphertext from the file, and writes remain
+atomic through a temporary file plus `os.replace`.
+
+Eviction runs during tier startup and new block admission; it is not a periodic
+background task. If no files can be removed while preserving
+`min_free_bytes`, the store job fails and the configured
+`kv_load_failure_policy` remains responsible for normal recomputation behavior.
+
+The tier exports these Prometheus metrics:
+
+```text
+vllm:kv_offload_encrypted_fs_cache_bytes
+vllm:kv_offload_encrypted_fs_cache_files
+vllm:kv_offload_encrypted_fs_cache_usage_perc
+vllm:kv_offload_encrypted_fs_disk_free_bytes
+vllm:kv_offload_encrypted_fs_evicted_bytes
+vllm:kv_offload_encrypted_fs_evicted_files
+vllm:kv_offload_encrypted_fs_admission_rejections
+vllm:kv_offload_encrypted_fs_stale_temp_files_removed
+```
 
 ## Security properties (tested)
 
