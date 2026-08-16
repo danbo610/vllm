@@ -371,6 +371,29 @@ class EncryptedFsCapacityManager:
         ):
             return cache_file.read()
 
+    def remove_blob(self, path: str) -> bool:
+        """Remove one invalid block and update shared capacity state."""
+        with self._writer_lock, self._directory_lock(exclusive=True):
+            try:
+                file_stat = os.stat(path, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+
+            state = self._read_state_locked()
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                return False
+
+            updated_state = _CacheState(
+                max(state.total_bytes - file_stat.st_size, 0),
+                max(state.total_files - 1, 0),
+            )
+            self._write_state_locked(updated_state)
+            self._set_current(updated_state)
+            self._remove_empty_shard_dirs(path)
+            return True
+
     def touch(self, path: str) -> None:
         """Mark a successfully decrypted block as recently used."""
         with self._directory_lock(exclusive=False), suppress(FileNotFoundError):

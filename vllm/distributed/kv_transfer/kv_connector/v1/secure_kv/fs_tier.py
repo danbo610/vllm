@@ -89,6 +89,22 @@ def _tmp_suffix() -> str:
     return f".tmp{os.getpid()}_{threading.get_ident()}"
 
 
+def _remove_failed_blob(path: str, capacity: EncryptedFsCapacityManager | None) -> None:
+    try:
+        if capacity is None:
+            os.remove(path)
+            removed = True
+        else:
+            removed = capacity.remove_blob(path)
+    except FileNotFoundError:
+        return
+    except Exception:
+        logger.exception("Failed to remove unreadable encrypted KV block %s", path)
+        return
+    if removed:
+        logger.warning("Removed unreadable encrypted KV block %s", path)
+
+
 def _encrypt_store(
     crypto: CryptoEngine,
     paths,
@@ -134,17 +150,21 @@ def _decrypt_load(
     load as failed (never injects garbage KV)."""
     flat = view.cast("B")
     for path, key, off in zip(paths, keys, offsets):
-        if capacity is None:
-            with open(path, "rb") as f:
-                blob = f.read()
-        else:
-            blob = capacity.load_blob(path)
-        plaintext = crypto.unseal(blob, _TIER_KEY_NS, expected_aad=_aad(key))
-        if len(plaintext) != block_size:
-            raise ValueError(
-                f"sealed block {os.path.basename(path)} decrypted to "
-                f"{len(plaintext)} bytes, expected {block_size}"
-            )
+        try:
+            if capacity is None:
+                with open(path, "rb") as f:
+                    blob = f.read()
+            else:
+                blob = capacity.load_blob(path)
+            plaintext = crypto.unseal(blob, _TIER_KEY_NS, expected_aad=_aad(key))
+            if len(plaintext) != block_size:
+                raise ValueError(
+                    f"sealed block {os.path.basename(path)} decrypted to "
+                    f"{len(plaintext)} bytes, expected {block_size}"
+                )
+        except Exception:
+            _remove_failed_blob(path, capacity)
+            raise
         flat[off : off + block_size] = plaintext
         if capacity is not None:
             capacity.touch(path)
@@ -174,6 +194,7 @@ class EncryptedFileSystemTierManager(FileSystemTierManager):
         if key_source.startswith("env:"):
             master_hex = os.environ.get(key_source[4:], "")
         self._crypto = CryptoEngine(KeyManager(master_hex), workers=crypto_workers)
+        self._load_job_keys = {}
         self._capacity = (
             EncryptedFsCapacityManager(
                 root_dir=root_dir,
@@ -245,6 +266,7 @@ class EncryptedFileSystemTierManager(FileSystemTierManager):
 
     @override
     def submit_load(self, job_metadata) -> None:
+        self._load_job_keys[job_metadata.job_id] = list(job_metadata.keys)
         task = functools.partial(
             _decrypt_load,
             self._crypto,
@@ -256,6 +278,15 @@ class EncryptedFileSystemTierManager(FileSystemTierManager):
             self._capacity,
         )
         self._pool.enqueue_load(job_metadata.job_id, 1, [task])
+
+    @override
+    def get_finished_jobs(self):
+        results = list(super().get_finished_jobs())
+        for result in results:
+            keys = self._load_job_keys.pop(result.job_id, None)
+            if keys is not None and not result.success:
+                self._lookup_manager.invalidate(keys)
+        return results
 
     @override
     def get_stats(self) -> OffloadingConnectorStats | None:

@@ -349,6 +349,47 @@ def test_factory_configures_encrypted_fs_capacity_and_metrics(tmp_path, monkeypa
         tier.shutdown()
 
 
+def test_encrypted_fs_failed_decrypt_removes_blob_and_invalidates_hit(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SKV_MASTER_KEY", "00" * 16)
+    tensor = _page_aligned_rand_tensor(4, _BLOCK_ELEMENTS)
+    tier = SecondaryTierFactory.create_secondary_tier(
+        {
+            "type": "encrypted_fs",
+            "root_dir": str(tmp_path),
+            "max_bytes": 64 * 1024 * 1024,
+            "min_free_bytes": 0,
+            "n_read_threads": 1,
+            "n_write_threads": 1,
+        },
+        memoryview(tensor.numpy()),
+        _MOCK_OFFLOADING_SPEC,
+    )
+    try:
+        block_key = key(123)
+        tier.submit_store(make_job(1, [block_key], [0]))
+        assert drain(tier)[0].success
+        assert lookup_and_wait(tier, [block_key]) == [LookupResult.HIT]
+
+        path = tier.file_mapper.get_file_name(block_key)
+        with open(path, "r+b") as cache_file:
+            cache_file.seek(-1, os.SEEK_END)
+            final_byte = cache_file.read(1)
+            cache_file.seek(-1, os.SEEK_END)
+            cache_file.write(bytes([final_byte[0] ^ 1]))
+
+        tier.submit_load(make_job(2, [block_key], [1], is_promotion=True))
+        result = drain(tier)[0]
+        assert not result.success
+        assert not os.path.exists(path)
+        assert tier.lookup(block_key, _CTX) is LookupResult.MISS
+        assert tier._capacity.snapshot().current_files == 0
+        assert tier._capacity.snapshot().current_bytes == 0
+    finally:
+        tier.shutdown()
+
+
 def test_failed_load_missing_file(fs_tier):
     """Test that loading a block whose file does not exist results in a failed job."""
     tier, _ = fs_tier

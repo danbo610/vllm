@@ -93,6 +93,13 @@ background task. If no files can be removed while preserving
 `min_free_bytes`, the store job fails and the configured
 `kv_load_failure_policy` remains responsible for normal recomputation behavior.
 
+If a block cannot be read, authenticated, or decoded to the expected size,
+the tier removes it from disk and shared capacity accounting. The failed load
+job also invalidates the async lookup manager's cached HIT, so the same request
+observes a MISS on its next lookup instead of repeatedly promoting the bad
+blob. With `kv_load_failure_policy: "recompute"`, vLLM then rebuilds the
+affected prefix and may store a fresh encrypted block.
+
 The tier exports these Prometheus metrics:
 
 ```text

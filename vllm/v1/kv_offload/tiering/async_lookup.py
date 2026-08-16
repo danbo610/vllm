@@ -172,6 +172,19 @@ class AsyncLookupManager(ABC):
                 if state is not None:
                     state.result = result
 
+    def invalidate(self, keys: Iterable[OffloadKey]) -> None:
+        """Turn cached hits into misses after an asynchronous load failure.
+
+        This runs on the scheduler thread, after the owning tier reports a
+        failed job. Keeping the existing lookup state preserves request
+        bookkeeping while preventing the same request from immediately
+        promoting the failed block again.
+        """
+        for key in keys:
+            state = self._lookup_state.get(key)
+            if state is not None:
+                state.result = False
+
     def cleanup(self, req_id: str) -> None:
         """Remove entries no longer needed by any active request.
 

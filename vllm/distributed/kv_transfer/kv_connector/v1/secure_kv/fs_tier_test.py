@@ -184,6 +184,11 @@ def main():
         _decrypt_load(crypto, paths, keys, memoryview(dst), offsets, block_size)
         check("byte-exact roundtrip", dst == src)
 
+        print("== idempotent store (existing file skipped) ==")
+        before = os.path.getmtime(paths[0])
+        _encrypt_store(crypto, paths, keys, view, offsets, block_size)
+        check("existing blobs not rewritten", os.path.getmtime(paths[0]) == before)
+
         print("== failure semantics ==")
         # relocation: right file, wrong key identity -> AAD mismatch
         try:
@@ -193,6 +198,7 @@ def main():
             check("relocated blob rejected", False, "unexpectedly loaded")
         except DecryptError:
             check("relocated blob rejected", True)
+        check("relocated blob removed", not os.path.exists(paths[0]))
         # tamper: flip one ciphertext byte
         with open(paths[2], "rb") as cache_file:
             b2 = bytearray(cache_file.read())
@@ -206,20 +212,17 @@ def main():
             check("tampered blob rejected", False, "unexpectedly loaded")
         except DecryptError:
             check("tampered blob rejected", True)
+        check("tampered blob removed", not os.path.exists(paths[2]))
         # wrong master key -> nothing recoverable
         crypto2 = CryptoEngine(KeyManager(secrets.token_hex(16)))
         try:
             _decrypt_load(
-                crypto2, [paths[0]], [keys[0]], memoryview(dst), [0], block_size
+                crypto2, [paths[1]], [keys[1]], memoryview(dst), [0], block_size
             )
             check("wrong master key rejected", False)
         except DecryptError:
             check("wrong master key rejected", True)
-
-        print("== idempotent store (existing file skipped) ==")
-        before = os.path.getmtime(paths[0])
-        _encrypt_store(crypto, paths, keys, view, offsets, block_size)
-        check("existing blobs not rewritten", os.path.getmtime(paths[0]) == before)
+        check("wrong-key blob removed", not os.path.exists(paths[1]))
 
     print("== capacity: LRU, restart, concurrency, free reserve ==")
     check_capacity_eviction()

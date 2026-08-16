@@ -57,6 +57,21 @@ class TestAsyncLookupManager:
         assert mgr.lookup(_key(1), _ctx()) is False
         mgr.shutdown()
 
+    def test_invalidate_turns_cached_hit_into_miss(self):
+        block_key = _key(1)
+        ctx = _ctx()
+        mgr = InMemoryLookupManager(existing_keys={block_key})
+        assert mgr.lookup(block_key, ctx) is None
+        mgr.flush()
+        mgr._results_ready.wait()
+        mgr._results_ready.clear()
+        assert mgr.lookup(block_key, ctx) is True
+
+        mgr.invalidate([block_key])
+
+        assert mgr.lookup(block_key, ctx) is False
+        mgr.shutdown()
+
     def test_multiple_keys_single_step(self):
         existing = {_key(1), _key(3)}
         mgr = InMemoryLookupManager(existing_keys=existing)
