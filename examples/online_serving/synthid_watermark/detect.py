@@ -12,8 +12,9 @@ Usage::
     python detect.py --tokenizer /path/to/model --jsonl results.jsonl
 
 The tokenizer path may also be set via the ``SYNTHID_TOKENIZER`` env var.
-Keys / ngram length come from ``SYNTHID_KEYS`` / ``SYNTHID_NGRAM_LEN`` and
-MUST match the serving side exactly.
+Keys come from ``SYNTHID_MASTER_KEY`` (128-bit hex, keys derived via
+SHA-256 — preferred) or ``SYNTHID_KEYS`` (comma-separated ints); ngram
+length from ``SYNTHID_NGRAM_LEN``. All MUST match the serving side exactly.
 
 z-score interpretation: unwatermarked text ~ N(0, 1); watermarked >> 0
 (z > 4 => p < 3e-5, strong evidence).
@@ -22,6 +23,7 @@ z-score interpretation: unwatermarked text ~ N(0, 1); watermarked >> 0
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -31,14 +33,29 @@ import torch
 from transformers import AutoTokenizer
 from transformers.generation import SynthIDTextWatermarkLogitsProcessor
 
-# Must match vllm/v1/sample/logits_processor/synthid.py exactly.
+
+def _derive_keys(master_hex: str, n: int = 20) -> list[int]:
+    """Must be byte-identical to the derivation in
+    vllm/v1/sample/logits_processor/synthid.py."""
+    mk = bytes.fromhex(master_hex)
+    return [
+        int.from_bytes(
+            hashlib.sha256(mk + i.to_bytes(4, "big")).digest()[:8], "big")
+        & 0x7FFFFFFFFFFFFFFF
+        for i in range(n)
+    ]
+
+
+# Key/config resolution must match synthid.py exactly.
+_MASTER_KEY = os.environ.get("SYNTHID_MASTER_KEY", "")
 _ENV_KEYS = os.environ.get("SYNTHID_KEYS", "")
-SYNTHID_KEYS = (
-    [int(x) for x in _ENV_KEYS.split(",") if x.strip()]
-    if _ENV_KEYS
-    else [654, 400, 836, 123, 340, 443, 597, 160, 57, 29,
-          590, 639, 13, 715, 468, 990, 966, 226, 324, 585]
-)
+if _MASTER_KEY:
+    SYNTHID_KEYS = _derive_keys(_MASTER_KEY)
+elif _ENV_KEYS:
+    SYNTHID_KEYS = [int(x) for x in _ENV_KEYS.split(",") if x.strip()]
+else:
+    SYNTHID_KEYS = [654, 400, 836, 123, 340, 443, 597, 160, 57, 29,
+                    590, 639, 13, 715, 468, 990, 966, 226, 324, 585]
 NGRAM_LEN = int(os.environ.get("SYNTHID_NGRAM_LEN", "5"))
 
 

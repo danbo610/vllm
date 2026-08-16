@@ -13,9 +13,15 @@ Opt-in per request via ``SamplingParams.extra_args`` (OpenAI API body field
 
 Configuration via environment variables (must match the detector side):
 
+* ``SYNTHID_MASTER_KEY``: 128-bit hex master key; the 20 watermark keys
+  are derived from it via SHA-256 (preferred for production — keep it
+  secret, e.g. in a KMS). Takes precedence over ``SYNTHID_KEYS``.
 * ``SYNTHID_KEYS``: comma-separated watermark keys (defaults to demo keys;
   REPLACE with secret keys for any production use).
 * ``SYNTHID_NGRAM_LEN``: watermark context window length (default 5).
+* ``SYNTHID_FORCE``: set to ``1`` to watermark ALL requests by default
+  (server-side enforcement); a request may still opt out explicitly with
+  ``"vllm_xargs": {"synthid_wm": 0}``.
 
 Device-consistency note: the pseudo-random sampling table MUST be generated
 on CPU. The same seed yields different tables on CPU vs CUDA RNGs, which
@@ -44,6 +50,7 @@ additionally skips any step whose window still contains a placeholder
 
 from __future__ import annotations
 
+import hashlib
 import os
 from typing import TYPE_CHECKING
 
@@ -59,14 +66,34 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+def _derive_keys(master_hex: str, n: int = 20) -> list[int]:
+    """Derive ``n`` int63 watermark keys from a 128-bit hex master key.
+
+    Deterministic — SHA-256(master || index) — so generation and detection
+    only need to share the single master key. The detector side MUST use
+    the identical derivation (see examples/online_serving/synthid_watermark).
+    """
+    mk = bytes.fromhex(master_hex)
+    return [
+        int.from_bytes(
+            hashlib.sha256(mk + i.to_bytes(4, "big")).digest()[:8], "big")
+        & 0x7FFFFFFFFFFFFFFF
+        for i in range(n)
+    ]
+
+
+_MASTER_KEY = os.environ.get("SYNTHID_MASTER_KEY", "")
 _ENV_KEYS = os.environ.get("SYNTHID_KEYS", "")
-SYNTHID_KEYS: list[int] = (
-    [int(x) for x in _ENV_KEYS.split(",") if x.strip()]
-    if _ENV_KEYS
-    else [654, 400, 836, 123, 340, 443, 597, 160, 57, 29,
-          590, 639, 13, 715, 468, 990, 966, 226, 324, 585]
-)
+if _MASTER_KEY:
+    SYNTHID_KEYS: list[int] = _derive_keys(_MASTER_KEY)
+elif _ENV_KEYS:
+    SYNTHID_KEYS = [int(x) for x in _ENV_KEYS.split(",") if x.strip()]
+else:
+    # Demo keys — replace via SYNTHID_MASTER_KEY / SYNTHID_KEYS in production.
+    SYNTHID_KEYS = [654, 400, 836, 123, 340, 443, 597, 160, 57, 29,
+                    590, 639, 13, 715, 468, 990, 966, 226, 324, 585]
 NGRAM_LEN = int(os.environ.get("SYNTHID_NGRAM_LEN", "5"))
+FORCE_WATERMARK = os.environ.get("SYNTHID_FORCE", "") == "1"
 CONTEXT_HISTORY_SIZE = 1024
 SAMPLING_TABLE_SEED = 0
 SAMPLING_TABLE_SIZE = 65536
@@ -131,8 +158,14 @@ class SynthIDLogitsProcessor(LogitsProcessor):
                    prompt_tok_ids: list[int] | None,
                    output_tok_ids: list[int]) -> _RowState | None:
         extra = getattr(params, "extra_args", None) or {}
-        if not extra.get("synthid_wm"):
-            return None  # not opted in -> no state, zero overhead
+        opt = extra.get("synthid_wm")
+        if opt is None:
+            if not FORCE_WATERMARK:
+                return None  # not opted in -> no state, zero overhead
+        elif not opt:
+            # Explicit "synthid_wm": 0 opts out, even under SYNTHID_FORCE
+            # (debugging / A/B reference traffic).
+            return None
         from transformers.generation import SynthIDTextWatermarkLogitsProcessor
 
         proc = SynthIDTextWatermarkLogitsProcessor(

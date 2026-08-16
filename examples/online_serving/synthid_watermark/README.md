@@ -23,7 +23,14 @@ per request via the OpenAI-compatible extension field `vllm_xargs`:
 
 Requests without the flag take a zero-overhead path. **Standard clients
 (Claude Code, plain OpenAI/Anthropic SDK calls) never send `vllm_xargs`,
-so their traffic is NOT watermarked** unless a gateway injects the field.
+so their traffic is NOT watermarked** unless a gateway injects the field —
+or the server enforces it:
+
+## Enabling the watermark (server-wide)
+
+Start the server with `SYNTHID_FORCE=1` to watermark **all** requests by
+default. A request may still opt out explicitly with
+`"vllm_xargs": {"synthid_wm": 0}` (debugging / A/B reference traffic).
 
 ## Detecting
 
@@ -57,8 +64,10 @@ through the same env vars on both sides:
 
 | Env var | Meaning | Default |
 |---|---|---|
+| `SYNTHID_MASTER_KEY` | 128-bit hex master key; 20 keys derived via SHA-256(master ‖ index). Preferred for production — keep secret. Takes precedence over `SYNTHID_KEYS` | — |
 | `SYNTHID_KEYS` | comma-separated watermark keys | demo keys — **replace in production** and keep secret |
 | `SYNTHID_NGRAM_LEN` | context window length | 5 |
+| `SYNTHID_FORCE` | `1` = server watermarks all requests by default (per-request `synthid_wm: 0` still opts out) | off |
 | `SYNTHID_TOKENIZER` | tokenizer for `detect.py` | — (or `--tokenizer`) |
 
 A key/ngram mismatch, or a different tokenizer, silently yields z ≈ 0.

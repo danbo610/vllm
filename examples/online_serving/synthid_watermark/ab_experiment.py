@@ -58,8 +58,9 @@ def gen(prompt: str, watermark: bool) -> dict:
         "top_k": 20,
         "chat_template_kwargs": {"enable_thinking": False},
     }
-    if watermark:
-        body["vllm_xargs"] = {"synthid_wm": 1}
+    # Explicit 1/0 keeps the A/B contrast correct in BOTH server modes:
+    # opt-in (default) and SYNTHID_FORCE=1 (watermark-by-default).
+    body["vllm_xargs"] = {"synthid_wm": 1 if watermark else 0}
     headers = {"Authorization": f"Bearer {KEY}"} if KEY else {}
     t0 = time.time()
     r = requests.post(URL, json=body, timeout=600, headers=headers)
