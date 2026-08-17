@@ -9,6 +9,7 @@ tokenizer plus the same key/config as generation — no GPU, no vLLM server.
 Usage::
 
     python detect.py --tokenizer /path/to/model --text "..."
+    python detect.py --tokenizer /path/to/model --file document.md
     python detect.py --tokenizer /path/to/model --jsonl results.jsonl
 
 The tokenizer path may also be set via the ``SYNTHID_TOKENIZER`` env var.
@@ -99,13 +100,17 @@ def main():
     ap.add_argument("--tokenizer", default=os.environ.get("SYNTHID_TOKENIZER"),
                     help="HF tokenizer path/name (env: SYNTHID_TOKENIZER)")
     ap.add_argument("--text", help="score a single text")
+    ap.add_argument("--file", help="score the whole content of a text file")
     ap.add_argument("--jsonl", help='score {"text", "group"} lines')
     args = ap.parse_args()
 
     if not args.tokenizer:
         sys.exit("error: --tokenizer (or SYNTHID_TOKENIZER env) is required")
-    if not args.text and not args.jsonl:
-        sys.exit("error: one of --text / --jsonl is required")
+    if sum(map(bool, (args.text, args.file, args.jsonl))) != 1:
+        sys.exit("error: exactly one of --text / --file / --jsonl is required")
+    if args.file:
+        with open(args.file, encoding="utf-8") as f:
+            args.text = f.read()
 
     tok = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     proc = build_processor()
